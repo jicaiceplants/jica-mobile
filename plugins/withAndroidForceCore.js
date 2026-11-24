@@ -1,20 +1,30 @@
 const { withProjectBuildGradle, withGradleProperties } = require('@expo/config-plugins');
 
+const setGradleProperty = (modResults, key, value) => {
+  const prop = modResults.find(
+    (item) => item.type === 'property' && item.key === key
+  );
+  if (prop) {
+    prop.value = value;
+  } else {
+    modResults.push({
+      type: 'property',
+      key,
+      value,
+    });
+  }
+};
+
 const withAndroidForceCore = (config) => {
-  // Ensure newArchEnabled is strictly false for react-native-maps compatibility
+  // Set gradle.properties for architecture, minification, and stability
   config = withGradleProperties(config, (modConfig) => {
-    const newArchProp = modConfig.modResults.find(
-      (item) => item.type === 'property' && item.key === 'newArchEnabled'
-    );
-    if (newArchProp) {
-      newArchProp.value = 'false';
-    } else {
-      modConfig.modResults.push({
-        type: 'property',
-        key: 'newArchEnabled',
-        value: 'false',
-      });
-    }
+    // Strictly disable New Architecture for react-native-maps & SQLite stability
+    setGradleProperty(modConfig.modResults, 'newArchEnabled', 'false');
+
+    // Disable release minification & resource shrinking so R8 does not strip WorkDatabase or Room reflection classes
+    setGradleProperty(modConfig.modResults, 'android.enableMinifyInReleaseBuilds', 'false');
+    setGradleProperty(modConfig.modResults, 'android.enableShrinkResourcesInReleaseBuilds', 'false');
+
     return modConfig;
   });
 

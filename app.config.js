@@ -58,7 +58,21 @@ module.exports = ({ config }) => ({
         "android": {
           "compileSdkVersion": 37,
           "targetSdkVersion": 36,
-          "newArchEnabled": false
+          "newArchEnabled": false,
+          "enableMinifyInReleaseBuilds": false,
+          "extraProguardRules": [
+            "# Keep WorkManager Database and Room reflection classes from R8 stripping",
+            "-keep class androidx.work.** { *; }",
+            "-keep class androidx.work.impl.** { *; }",
+            "-keep class * extends androidx.room.RoomDatabase {",
+            "    <init>();",
+            "    *;",
+            "}",
+            "-keepclassmembers class * extends androidx.room.RoomDatabase {",
+            "    <init>();",
+            "}",
+            "-dontwarn androidx.work.**"
+          ].join("\n")
         }
       }
     ],
