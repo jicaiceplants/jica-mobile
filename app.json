@@ -6,10 +6,15 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
+    "updates": {
+      "enabled": false,
+      "checkAutomatically": "NEVER"
+    },
     "ios": {
       "supportsTablet": true
     },
     "android": {
+      "versionCode": 2,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -19,9 +24,10 @@
       "predictiveBackGestureEnabled": false,
       "config": {
         "googleMaps": {
-          "apiKey": ""
+          "apiKey": "AIzaSyDLXnIoJZ52QoTQH3m330JH1Su_ly0qF1w"
         }
-      }
+      },
+      "package": "com.jicaiceplants.icetrackmobile"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -36,6 +42,15 @@
           "imageWidth": 200,
           "resizeMode": "contain",
           "backgroundColor": "#F1F5F9"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "compileSdkVersion": 35,
+            "targetSdkVersion": 35
+          }
         }
       ]
     ]
