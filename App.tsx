@@ -15,6 +15,7 @@ import MapScreen from './src/screens/MapScreen';
 import { initDatabase } from './src/services/DatabaseService';
 import { startLocationTracking, stopLocationTracking } from './src/services/LocationService';
 import { startNetworkListener } from './src/services/SyncService';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
 
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -56,67 +57,71 @@ export default function App() {
 
   if (!isAppReady) {
     return (
-      <View style={styles.splashContainer}>
-        <StatusBar style="dark" />
-        <View style={styles.splashCard}>
-          <Image 
-            source={require('./assets/JICA Ice Logistics Logo.png')} 
-            style={styles.splashLogo} 
-            resizeMode="contain" 
-          />
-          <Text style={styles.splashTitle}>IceTrack</Text>
-          <Text style={styles.splashSubtitle}>
-            J.I.C.A ICE LOGISTICS & DELIVERY • CDO
-          </Text>
-          <View style={styles.loadingWrapper}>
-            <ActivityIndicator size="large" color="#00875A" />
-            <Text style={styles.loadingText}>Initializing local storage & route manifest...</Text>
+      <ErrorBoundary>
+        <View style={styles.splashContainer}>
+          <StatusBar style="dark" />
+          <View style={styles.splashCard}>
+            <Image 
+              source={require('./assets/JICA Ice Logistics Logo.png')} 
+              style={styles.splashLogo} 
+              resizeMode="contain" 
+            />
+            <Text style={styles.splashTitle}>IceTrack</Text>
+            <Text style={styles.splashSubtitle}>
+              J.I.C.A ICE LOGISTICS & DELIVERY • CDO
+            </Text>
+            <View style={styles.loadingWrapper}>
+              <ActivityIndicator size="large" color="#00875A" />
+              <Text style={styles.loadingText}>Initializing local storage & route manifest...</Text>
+            </View>
           </View>
+          <Text style={styles.splashFooter}>
+            Gusa Depot, Cagayan de Oro City • RA 10173 Compliant
+          </Text>
         </View>
-        <Text style={styles.splashFooter}>
-          Gusa Depot, Cagayan de Oro City • RA 10173 Compliant
-        </Text>
-      </View>
+      </ErrorBoundary>
     );
   }
 
   return (
-    <SafeAreaProvider>
-      <StatusBar style="light" />
-      <NavigationContainer>
-        <Stack.Navigator
-          initialRouteName="Login"
-          screenOptions={{
-            headerShown: false,
-            headerStyle: {
-              backgroundColor: Theme.colors.primary,
-            },
-            headerTintColor: Theme.colors.surface,
-            headerTitleStyle: {
-              fontWeight: 'bold',
-            },
-            headerTitleAlign: 'center',
-          }}
-        >
-          <Stack.Screen 
-            name="Login" 
-            component={LoginScreen} 
-          />
-          <Stack.Screen 
-            name="Main" 
-            component={HomeScreen} 
-          />
-          <Stack.Screen 
-            name="ActiveRoute" 
-            component={ActiveRouteScreen} 
-          />
-          <Stack.Screen
-            name="Map"
-            component={MapScreen}
-          />
-        </Stack.Navigator>
-      </NavigationContainer>
-    </SafeAreaProvider>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <StatusBar style="light" />
+        <NavigationContainer>
+          <Stack.Navigator
+            initialRouteName="Login"
+            screenOptions={{
+              headerShown: false,
+              headerStyle: {
+                backgroundColor: Theme.colors.primary,
+              },
+              headerTintColor: Theme.colors.surface,
+              headerTitleStyle: {
+                fontWeight: 'bold',
+              },
+              headerTitleAlign: 'center',
+            }}
+          >
+            <Stack.Screen 
+              name="Login" 
+              component={LoginScreen} 
+            />
+            <Stack.Screen 
+              name="Main" 
+              component={HomeScreen} 
+            />
+            <Stack.Screen 
+              name="ActiveRoute" 
+              component={ActiveRouteScreen} 
+            />
+            <Stack.Screen
+              name="Map"
+              component={MapScreen}
+            />
+          </Stack.Navigator>
+        </NavigationContainer>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
 

@@ -1,0 +1,70 @@
+const GOOGLE_MAPS_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_ANDROID_KEY || "AIzaSyDLXnIoJZ52QoTQH3m330JH1Su_ly0qF1w";
+
+module.exports = ({ config }) => ({
+  ...config,
+  name: "IceTrack",
+  slug: "icetrack-mobile",
+  version: "1.0.0",
+  orientation: "portrait",
+  icon: "./assets/icon.png",
+  userInterfaceStyle: "light",
+  updates: {
+    enabled: false,
+    checkAutomatically: "NEVER"
+  },
+  ios: {
+    supportsTablet: true
+  },
+  android: {
+    versionCode: 2,
+    adaptiveIcon: {
+      backgroundColor: "#E6F4FE",
+      foregroundImage: "./assets/android-icon-foreground.png",
+      backgroundImage: "./assets/android-icon-background.png",
+      monochromeImage: "./assets/android-icon-monochrome.png"
+    },
+    predictiveBackGestureEnabled: false,
+    permissions: [
+      "ACCESS_COARSE_LOCATION",
+      "ACCESS_FINE_LOCATION"
+    ],
+    config: {
+      googleMaps: {
+        apiKey: GOOGLE_MAPS_KEY
+      }
+    },
+    package: "com.jicaiceplants.icetrackmobile"
+  },
+  web: {
+    favicon: "./assets/favicon.png"
+  },
+  plugins: [
+    "expo-sqlite",
+    "expo-status-bar",
+    [
+      "expo-splash-screen",
+      {
+        "image": "./assets/splash-icon.png",
+        "imageWidth": 200,
+        "resizeMode": "contain",
+        "backgroundColor": "#F1F5F9"
+      }
+    ],
+    [
+      "expo-build-properties",
+      {
+        "android": {
+          "compileSdkVersion": 37,
+          "targetSdkVersion": 36,
+          "newArchEnabled": false
+        }
+      }
+    ],
+    "./plugins/withAndroidForceCore.js"
+  ],
+  extra: {
+    eas: {
+      projectId: "169a5b4c-fd4e-48d2-9293-9aa3e16ee2f7"
+    }
+  }
+});
