@@ -277,7 +277,7 @@ export default function ActiveRouteScreen({ route }: any) {
 
   // Poll for Active Emergency SOS Dispatcher Acknowledgements ("Help is on the Way")
   useEffect(() => {
-    const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.1.24:8000";
+    const backendUrl = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
     const checkSosStatus = async () => {
       try {
         const res = await fetch(`${backendUrl}/api/v1/telemetry/sos/active`);

@@ -123,7 +123,7 @@ export async function fetchTurnByTurnRoute(
   origin: LatLng,
   destination: { id: string; name: string; lat: number; lng: number }
 ): Promise<RouteNavigationPayload> {
-  const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL;
+  const backendUrl = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
 
   if (backendUrl && !backendUrl.includes("placeholder")) {
     try {

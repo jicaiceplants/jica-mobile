@@ -67,7 +67,7 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
       });
 
       // 3. Immediately broadcast to FastAPI backend if online
-      const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.1.24:8000";
+      const backendUrl = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
       try {
         await fetch(`${backendUrl}/api/v1/telemetry/sos`, {
           method: 'POST',

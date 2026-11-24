@@ -18,7 +18,7 @@ import * as Location from 'expo-location';
 import { getSetting, setSetting } from '../services/DatabaseService';
 import { supabase } from '../services/SupabaseClient';
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.1.24:8000";
+const BACKEND_URL = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
 
 // Minimal Default Driver Account for Initial Setup
 const DEFAULT_ACCOUNT = {

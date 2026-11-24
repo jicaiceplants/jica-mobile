@@ -4,7 +4,7 @@ import { supabase } from './SupabaseClient';
 
 let isSyncing = false;
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.1.24:8000";
+const BACKEND_URL = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
 
 export const syncDataWithServer = async (driverId?: string, truckId?: string) => {
   if (isSyncing) return;
