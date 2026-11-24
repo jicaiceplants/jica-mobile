@@ -1,71 +1,89 @@
 import * as SQLite from 'expo-sqlite';
 
-let db: SQLite.SQLiteDatabase | null = null;
+let dbInstance: SQLite.SQLiteDatabase | null = null;
+let initPromise: Promise<SQLite.SQLiteDatabase | null> | null = null;
 
-export const initDatabase = async () => {
-  try {
-    db = await SQLite.openDatabaseAsync('jica.db');
+export const getDb = async (): Promise<SQLite.SQLiteDatabase | null> => {
+  if (dbInstance) return dbInstance;
+  if (initPromise) return initPromise;
 
-    // Create GPS queue table with batching support
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS queued_gps (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        lat REAL NOT NULL,
-        lng REAL NOT NULL,
-        timestamp TEXT NOT NULL
-      );
-    `);
+  initPromise = (async () => {
+    try {
+      const db = await SQLite.openDatabaseAsync('jica.db');
 
-    // Create Transactions queue table with idempotency & partial delivery tracking
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS queued_transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        idempotency_key TEXT UNIQUE NOT NULL,
-        stop_id TEXT NOT NULL,
-        customer_name TEXT NOT NULL,
-        planned_qty INTEGER NOT NULL,
-        delivered_qty INTEGER NOT NULL,
-        returned_qty INTEGER NOT NULL,
-        unit_price REAL NOT NULL,
-        total_amount REAL NOT NULL,
-        payment_method TEXT NOT NULL,
-        partial_reason TEXT,
-        timestamp TEXT NOT NULL
-      );
-    `);
+      // Create GPS queue table with batching support
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS queued_gps (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          lat REAL NOT NULL,
+          lng REAL NOT NULL,
+          timestamp TEXT NOT NULL
+        );
+      `);
 
-    // Create Emergency SOS table
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS queued_sos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        idempotency_key TEXT UNIQUE NOT NULL,
-        driver_id TEXT NOT NULL,
-        truck_id TEXT NOT NULL,
-        load_slip_id TEXT,
-        reason TEXT NOT NULL,
-        latitude REAL NOT NULL,
-        longitude REAL NOT NULL,
-        timestamp TEXT NOT NULL
-      );
-    `);
+      // Create Transactions queue table with idempotency & partial delivery tracking
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS queued_transactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          idempotency_key TEXT UNIQUE NOT NULL,
+          stop_id TEXT NOT NULL,
+          customer_name TEXT NOT NULL,
+          planned_qty INTEGER NOT NULL,
+          delivered_qty INTEGER NOT NULL,
+          returned_qty INTEGER NOT NULL,
+          unit_price REAL NOT NULL,
+          total_amount REAL NOT NULL,
+          payment_method TEXT NOT NULL,
+          partial_reason TEXT,
+          timestamp TEXT NOT NULL
+        );
+      `);
 
-    // Create App Settings / Flags table (for one-time terms consent, etc.)
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS app_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-    `);
+      // Create Emergency SOS table
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS queued_sos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          idempotency_key TEXT UNIQUE NOT NULL,
+          driver_id TEXT NOT NULL,
+          truck_id TEXT NOT NULL,
+          load_slip_id TEXT,
+          reason TEXT NOT NULL,
+          latitude REAL NOT NULL,
+          longitude REAL NOT NULL,
+          timestamp TEXT NOT NULL
+        );
+      `);
 
-    console.log('JICA SQLite Database initialized with idempotency, SOS & settings schema');
-  } catch (error) {
-    console.error('Error initializing SQLite database:', error);
-  }
+      // Create App Settings / Flags table (for one-time terms consent, etc.)
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS app_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+      `);
+
+      dbInstance = db;
+      console.log('JICA SQLite Database initialized with idempotency, SOS & settings schema');
+      return dbInstance;
+    } catch (error) {
+      console.error('Error initializing SQLite database:', error);
+      return null;
+    } finally {
+      initPromise = null;
+    }
+  })();
+
+  return initPromise;
 };
 
-export const queueGPS = async (lat: number, lng: number) => {
-  if (!db) return;
+export const initDatabase = async (): Promise<void> => {
+  await getDb();
+};
+
+export const queueGPS = async (lat: number, lng: number): Promise<void> => {
   try {
+    const db = await getDb();
+    if (!db) return;
     const timestamp = new Date().toISOString();
     await db.runAsync(
       'INSERT INTO queued_gps (lat, lng, timestamp) VALUES (?, ?, ?)',
@@ -90,9 +108,10 @@ export interface QueueTransactionParams {
   partialReason?: string;
 }
 
-export const queueTransaction = async (params: QueueTransactionParams) => {
-  if (!db) return;
+export const queueTransaction = async (params: QueueTransactionParams): Promise<void> => {
   try {
+    const db = await getDb();
+    if (!db) return;
     const timestamp = new Date().toISOString();
     await db.runAsync(
       `INSERT OR REPLACE INTO queued_transactions (
@@ -120,9 +139,10 @@ export const queueTransaction = async (params: QueueTransactionParams) => {
   }
 };
 
-export const getQueuedGPS = async () => {
-  if (!db) return [];
+export const getQueuedGPS = async (): Promise<any[]> => {
   try {
+    const db = await getDb();
+    if (!db) return [];
     return await db.getAllAsync('SELECT * FROM queued_gps');
   } catch (error) {
     console.error('Error getting GPS queue:', error);
@@ -130,9 +150,10 @@ export const getQueuedGPS = async () => {
   }
 };
 
-export const getQueuedTransactions = async () => {
-  if (!db) return [];
+export const getQueuedTransactions = async (): Promise<any[]> => {
   try {
+    const db = await getDb();
+    if (!db) return [];
     return await db.getAllAsync('SELECT * FROM queued_transactions');
   } catch (error) {
     console.error('Error getting transactions queue:', error);
@@ -151,9 +172,10 @@ export interface QueueSOSParams {
   timestamp: string;
 }
 
-export const queueSOS = async (params: QueueSOSParams) => {
-  if (!db) return;
+export const queueSOS = async (params: QueueSOSParams): Promise<void> => {
   try {
+    const db = await getDb();
+    if (!db) return;
     await db.runAsync(
       `INSERT OR REPLACE INTO queued_sos (
         idempotency_key, driver_id, truck_id, load_slip_id, reason, latitude, longitude, timestamp
@@ -175,9 +197,10 @@ export const queueSOS = async (params: QueueSOSParams) => {
   }
 };
 
-export const getQueuedSOS = async () => {
-  if (!db) return [];
+export const getQueuedSOS = async (): Promise<any[]> => {
   try {
+    const db = await getDb();
+    if (!db) return [];
     return await db.getAllAsync('SELECT * FROM queued_sos ORDER BY id ASC');
   } catch (error) {
     console.error('Error getting queued SOS:', error);
@@ -185,9 +208,10 @@ export const getQueuedSOS = async () => {
   }
 };
 
-export const clearQueues = async (gpsIds: number[], txIds: number[]) => {
-  if (!db) return;
+export const clearQueues = async (gpsIds: number[], txIds: number[]): Promise<void> => {
   try {
+    const db = await getDb();
+    if (!db) return;
     if (gpsIds.length > 0) {
       const placeholders = gpsIds.map(() => '?').join(',');
       await db.runAsync(`DELETE FROM queued_gps WHERE id IN (${placeholders})`, gpsIds);
@@ -203,8 +227,9 @@ export const clearQueues = async (gpsIds: number[], txIds: number[]) => {
 };
 
 export const getSetting = async (key: string): Promise<string | null> => {
-  if (!db) return null;
   try {
+    const db = await getDb();
+    if (!db) return null;
     const row: any = await db.getFirstAsync('SELECT value FROM app_settings WHERE key = ?', [key]);
     return row ? row.value : null;
   } catch (error) {
@@ -213,8 +238,9 @@ export const getSetting = async (key: string): Promise<string | null> => {
 };
 
 export const setSetting = async (key: string, value: string): Promise<void> => {
-  if (!db) return;
   try {
+    const db = await getDb();
+    if (!db) return;
     await db.runAsync('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)', [key, value]);
   } catch (error) {
     console.error(`Error saving setting ${key}:`, error);

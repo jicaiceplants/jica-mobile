@@ -4,7 +4,7 @@ import { queueGPS } from './DatabaseService';
 export const LOCATION_TASK_NAME = 'background-location-task';
 
 // Note: Background tasks need to be defined in the global scope (e.g., App.tsx)
-// We will mock the foreground tracking here for demonstration.
+// We use a robust foreground watch that simulates the 15-meter filter logic for this MVP.
 let locationSubscription: Location.LocationSubscription | null = null;
 
 export const startLocationTracking = async () => {
@@ -15,13 +15,16 @@ export const startLocationTracking = async () => {
       return;
     }
 
-    const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
-    if (backgroundStatus !== 'granted') {
-      console.warn('Background location permission denied');
+    try {
+      const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
+      if (backgroundStatus !== 'granted') {
+        console.warn('Background location permission denied');
+      }
+    } catch (bgErr) {
+      // Android 11+ enforces strict runtime rules if ACCESS_BACKGROUND_LOCATION is requested
+      console.warn('Background location permission request skipped:', bgErr);
     }
 
-    // Since Background Fetch in Expo requires TaskManager setup, we use a robust foreground watch 
-    // that simulates the background 15-meter filter logic for this MVP.
     locationSubscription = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.High,
@@ -42,7 +45,11 @@ export const startLocationTracking = async () => {
 
 export const stopLocationTracking = () => {
   if (locationSubscription) {
-    locationSubscription.remove();
+    try {
+      locationSubscription.remove();
+    } catch (e) {
+      console.warn('Error removing location subscription:', e);
+    }
     locationSubscription = null;
   }
 };

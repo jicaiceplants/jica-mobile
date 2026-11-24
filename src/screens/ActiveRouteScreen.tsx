@@ -322,12 +322,16 @@ export default function ActiveRouteScreen({ route }: any) {
         setDriverPos(nextPos);
 
         if (isFollowingDriver && mapRef.current) {
-          mapRef.current.animateCamera({
-            center: { latitude: nextPos.latitude, longitude: nextPos.longitude },
-            heading: nextPos.heading,
-            pitch: isNavigating ? 45 : 35,
-            zoom: isNavigating ? 17 : 16
-          }, { duration: 600 });
+          try {
+            mapRef.current.animateCamera({
+              center: { latitude: nextPos.latitude, longitude: nextPos.longitude },
+              heading: nextPos.heading,
+              pitch: isNavigating ? 45 : 35,
+              zoom: isNavigating ? 17 : 16
+            }, { duration: 600 });
+          } catch (cameraErr) {
+            // Native camera animation safe catch
+          }
         }
 
         // Automatic Turn-by-Turn Waypoint Advancement ($0 extra cloud calls)
