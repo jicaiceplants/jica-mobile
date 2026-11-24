@@ -48,11 +48,17 @@
         "expo-build-properties",
         {
           "android": {
-            "compileSdkVersion": 35,
+            "compileSdkVersion": 36,
             "targetSdkVersion": 35
           }
         }
-      ]
-    ]
+      ],
+      "./plugins/withAndroidForceCore.js"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "169a5b4c-fd4e-48d2-9293-9aa3e16ee2f7"
+      }
+    }
   }
 }
