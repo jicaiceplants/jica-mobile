@@ -43,6 +43,7 @@ import {
   subscribeSessionRevoked,
   notifySessionRevoked,
   isUuid,
+  formatProductLabel,
   SESSION_REVOKED_MESSAGE
 } from '../services/SessionService';
 
@@ -270,10 +271,14 @@ export default function HomeScreen({ route, navigation }: any) {
     const totalSacks = items.reduce((sum: number, it: any) => sum + (it.planned_qty || 0), 0);
     const hubsSet = new Set(items.map((it: any) => it.hub_id || it.delivery_hubs?.id || it.customer_name));
 
-    // Group inventory by product_name
+    // Group inventory by standardized Product Name (Sack Size Sack)
     const invMap = new Map<string, number>();
     items.forEach((it: any) => {
-      const typeName = it.product_name || it.ice_type || it.description || "Ice Sacks";
+      const typeName = formatProductLabel(
+        it.product_name || it.ice_type || it.description,
+        it.sack_size,
+        "Ice Sacks"
+      );
       invMap.set(typeName, (invMap.get(typeName) || 0) + (it.planned_qty || 0));
     });
 

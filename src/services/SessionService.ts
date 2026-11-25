@@ -16,6 +16,25 @@ export function isUuid(val?: string | null): boolean {
 }
 
 /**
+ * Standardized Ice Product label across mobile & web:
+ * e.g., ("Tube Ice", "Medium") => "Tube Ice (Medium Sack)" without duplicating "Sack".
+ */
+export function formatProductLabel(
+  name?: string | null,
+  sackSize?: string | null,
+  fallback: string = "Ice Product"
+): string {
+  const cleanName = (name || fallback).trim() || fallback;
+  const cleanSize = (sackSize || "").trim();
+  if (!cleanSize) return cleanName;
+  const suffix = /\bsack\b/i.test(cleanSize) ? cleanSize : `${cleanSize} Sack`;
+  if (cleanName.toLowerCase().includes(`(${suffix.toLowerCase()})`)) {
+    return cleanName;
+  }
+  return `${cleanName} (${suffix})`;
+}
+
+/**
  * Returns YYYY-MM-DD in Asia/Manila (UTC+8) safely on Hermes Android & iOS.
  */
 export function getManilaDateString(dateInput: Date = new Date()): string {

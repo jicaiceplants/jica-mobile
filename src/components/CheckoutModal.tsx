@@ -1,15 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  View, 
-  Text, 
-  StyleSheet, 
-  Modal, 
-  TouchableOpacity, 
-  TextInput, 
-  ScrollView 
+import {
+  View,
+  Text,
+  StyleSheet,
+  Modal,
+  TouchableOpacity,
+  TextInput,
+  ScrollView
 } from 'react-native';
 import { Theme } from '../constants/Theme';
 import { X, Banknote, FileText, Minus, Plus, AlertCircle, CheckCircle } from 'lucide-react-native';
+import { formatProductLabel } from '../services/SessionService';
 
 interface CustomerStop {
   id: string;
@@ -44,11 +45,11 @@ const PARTIAL_REASONS = [
   "Store Space / Power Issue"
 ];
 
-export default function CheckoutModal({ 
-  visible, 
-  stop, 
-  onClose, 
-  onComplete 
+export default function CheckoutModal({
+  visible,
+  stop,
+  onClose,
+  onComplete
 }: CheckoutModalProps) {
   const planned = stop?.plannedQty || Math.max(1, Math.round((stop?.amount || 150) / 150));
   const unitPrice =
@@ -91,7 +92,7 @@ export default function CheckoutModal({
     if (isSubmitting) return;
     setIsSubmitting(true);
 
-    const reason = isPartial 
+    const reason = isPartial
       ? (selectedReason === "Other Reason" ? customReason : selectedReason)
       : undefined;
 
@@ -118,6 +119,11 @@ export default function CheckoutModal({
             <View style={{ flex: 1 }}>
               <Text style={styles.title}>Confirm Delivery</Text>
               <Text style={styles.stopName}>{stop.name}</Text>
+              {(stop.iceType || stop.sackSize) && (
+                <Text style={{ fontSize: 12, color: Theme.colors.primary, fontWeight: '700', marginTop: 2 }}>
+                  {formatProductLabel(stop.iceType, stop.sackSize)}
+                </Text>
+              )}
             </View>
             <TouchableOpacity onPress={onClose} style={styles.closeBtn}>
               <X size={24} color={Theme.colors.textSecondary} />
@@ -133,7 +139,7 @@ export default function CheckoutModal({
               </View>
 
               <View style={styles.qtyControlsRow}>
-                <TouchableOpacity 
+                <TouchableOpacity
                   onPress={handleDecrement}
                   disabled={deliveredQty <= 0}
                   style={[styles.qtyButton, deliveredQty <= 0 && styles.qtyButtonDisabled]}
@@ -146,7 +152,7 @@ export default function CheckoutModal({
                   <Text style={styles.qtyUnit}>sacks delivered</Text>
                 </View>
 
-                <TouchableOpacity 
+                <TouchableOpacity
                   onPress={handleIncrement}
                   disabled={deliveredQty >= planned}
                   style={[styles.qtyButton, deliveredQty >= planned && styles.qtyButtonDisabled]}

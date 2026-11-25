@@ -66,6 +66,7 @@ import {
   subscribeSessionRevoked,
   notifySessionRevoked,
   isUuid,
+  formatProductLabel,
   SESSION_REVOKED_MESSAGE
 } from '../services/SessionService';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -252,10 +253,20 @@ export default function ActiveRouteScreen({ route }: any) {
     if (!driver?.id && !driver?.truckId) return;
     setIsLoadingRoute(true);
     try {
-      // 1. Fetch live delivery hubs & products (reading canonical standard_price)
+      // 1. Fetch live delivery hubs & products (explicit lightweight column projections)
       const [{ data: hubsData }, { data: prodsData }] = await Promise.all([
-        supabase.from("delivery_hubs").select("*").is("deleted_at", null).eq("is_active", true).order("name"),
-        supabase.from("products").select("*").is("deleted_at", null).eq("is_active", true).order("name")
+        supabase
+          .from("delivery_hubs")
+          .select("id, name, address, latitude, longitude, zone, photo_url")
+          .is("deleted_at", null)
+          .eq("is_active", true)
+          .order("name"),
+        supabase
+          .from("products")
+          .select("id, name, sack_size, standard_price, image_url")
+          .is("deleted_at", null)
+          .eq("is_active", true)
+          .order("name")
       ]);
 
       if (hubsData && hubsData.length > 0) {
@@ -266,7 +277,7 @@ export default function ActiveRouteScreen({ route }: any) {
       if (prodsData && prodsData.length > 0) {
         setAvailableProducts(prodsData);
         setSelectedProductId(prev => prev || prodsData[0].id);
-        setExtraPrice(String(prodsData[0].standard_price ?? prodsData[0].price ?? 0));
+        setExtraPrice(String(prodsData[0].standard_price ?? 0));
       }
 
       const todayStr = getManilaDateString();
@@ -499,7 +510,7 @@ export default function ActiveRouteScreen({ route }: any) {
 
     let locationSub: Location.LocationSubscription | null = null;
     Location.watchPositionAsync(
-      { accuracy: Location.Accuracy.High, distanceInterval: 10 },
+      { accuracy: Location.Accuracy.Balanced, distanceInterval: 20, timeInterval: 8000 },
       (loc) => {
         const nextPos = {
           latitude: loc.coords.latitude,
@@ -1084,7 +1095,7 @@ export default function ActiveRouteScreen({ route }: any) {
                         {c.name}
                       </Text>
                       <Text style={styles.customerSub}>
-                        {c.plannedQty} sacks • ₱{c.unitPrice}/sack • {c.isInstitutional ? 'Institutional Priority' : 'Standard Drop'}
+                        {formatProductLabel(c.productName, c.sackSize)} • {c.plannedQty} sacks • ₱{c.unitPrice}/sack
                       </Text>
                     </View>
                   </View>
@@ -1510,7 +1521,15 @@ export default function ActiveRouteScreen({ route }: any) {
       {/* Checkout Modal */}
       <CheckoutModal
         visible={checkoutVisible}
-        stop={selectedCustomer}
+        stop={
+          selectedCustomer
+            ? {
+                ...selectedCustomer,
+                iceType: selectedCustomer.productName,
+                sackSize: selectedCustomer.sackSize
+              }
+            : null
+        }
         onClose={() => setCheckoutVisible(false)}
         onComplete={handleCheckoutComplete}
       />
@@ -1694,7 +1713,7 @@ export default function ActiveRouteScreen({ route }: any) {
                           }}
                         >
                           <Text style={[styles.hubChipText, selectedProductId === p.id && styles.hubChipTextActive]}>
-                            {p.name} (₱{prodPrice})
+                            {formatProductLabel(p.name, p.sack_size)} (₱{prodPrice})
                           </Text>
                         </TouchableOpacity>
                       );
