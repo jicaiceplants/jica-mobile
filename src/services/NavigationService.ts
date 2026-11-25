@@ -1,4 +1,5 @@
 // Standardized Google Routes API v2 Navigation Data Contract
+import { getSetting, setSetting } from './DatabaseService';
 
 export type RouteManeuver = 
   | 'depart'
@@ -37,10 +38,58 @@ export interface RouteNavigationPayload {
   routeId: string;
   destinationId: string;
   destinationName: string;
+  encodedPolyline?: string;
   overviewPolyline: LatLng[];
   totalDistanceMeters: number;
   totalDurationSeconds: number;
   steps: RouteStep[];
+  isFallback?: boolean;
+}
+
+const memoryRouteCache = new Map<string, RouteNavigationPayload>();
+
+/**
+ * Decodes a Google Encoded Polyline Algorithm Format string into LatLng points.
+ */
+export function decodeEncodedPolyline(encoded: string): LatLng[] {
+  if (!encoded || typeof encoded !== 'string') return [];
+  const points: LatLng[] = [];
+  let index = 0;
+  let lat = 0;
+  let lng = 0;
+
+  while (index < encoded.length) {
+    let shift = 0;
+    let result = 0;
+    let byte = 0;
+    do {
+      if (index >= encoded.length) break;
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+    const dlat = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
+    lat += dlat;
+
+    if (index >= encoded.length) break;
+    shift = 0;
+    result = 0;
+    do {
+      if (index >= encoded.length) break;
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+    const dlng = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
+    lng += dlng;
+
+    points.push({
+      latitude: Number((lat / 1e5).toFixed(6)),
+      longitude: Number((lng / 1e5).toFixed(6))
+    });
+  }
+
+  return points;
 }
 
 // Haversine distance calculator in meters
@@ -76,7 +125,7 @@ function generateFallbackRoute(
   const midLng = (origin.longitude + destination.lng) / 2;
 
   return {
-    routeId: `ROUTE-DYNAMIC-${destination.id}`,
+    routeId: `ROUTE-OFFLINE-${destination.id}`,
     destinationId: destination.id,
     destinationName: destination.name,
     totalDistanceMeters: distMeters,
@@ -86,6 +135,7 @@ function generateFallbackRoute(
       { latitude: midLat, longitude: midLng },
       { latitude: destination.lat, longitude: destination.lng }
     ],
+    isFallback: true,
     steps: [
       {
         stepIndex: 0,
@@ -98,7 +148,7 @@ function generateFallbackRoute(
       },
       {
         stepIndex: 1,
-        instruction: `Continue straight along optimal corridor toward ${destination.name}`,
+        instruction: `Continue along CDO arterial corridor toward ${destination.name}`,
         maneuver: "straight",
         distanceMeters: Math.round(distMeters * 0.6),
         durationSeconds: Math.round(durSeconds * 0.6),
@@ -118,11 +168,44 @@ function generateFallbackRoute(
   };
 }
 
-// Service API Switcher: calls live FastAPI + Google Routes API v2, falling back to dynamic route calculation
+function sanitizePolylinePoints(rawPoints: any): LatLng[] {
+  if (!Array.isArray(rawPoints)) return [];
+  return rawPoints
+    .filter((pt: any) => pt && Number.isFinite(Number(pt.latitude)) && Number.isFinite(Number(pt.longitude)))
+    .map((pt: any) => ({
+      latitude: Number(pt.latitude),
+      longitude: Number(pt.longitude)
+    }));
+}
+
+// Service API Switcher: calls live FastAPI + Google Routes API v2 with local caching, falling back strictly when offline
 export async function fetchTurnByTurnRoute(
   origin: LatLng,
-  destination: { id: string; name: string; lat: number; lng: number }
+  destination: { id: string; name: string; lat: number; lng: number },
+  options?: { forceRefresh?: boolean; waypoints?: LatLng[] }
 ): Promise<RouteNavigationPayload> {
+  const destId = destination.id || `${destination.lat.toFixed(4)},${destination.lng.toFixed(4)}`;
+  const roundedOriginKey = `${origin.latitude.toFixed(3)},${origin.longitude.toFixed(3)}`;
+  const cacheKey = `${destId}|${roundedOriginKey}|${destination.lat.toFixed(4)},${destination.lng.toFixed(4)}`;
+  const sqliteCacheKey = `cached_nav_route_${destId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+
+  if (!options?.forceRefresh) {
+    // 1. Check in-memory cache for this exact/nearby origin + destination
+    const exactCached = memoryRouteCache.get(cacheKey);
+    if (exactCached && exactCached.overviewPolyline.length >= 2 && !exactCached.isFallback) {
+      return exactCached;
+    }
+
+    // 2. Reuse cached destination route if origin is within 400m of its start point (prevents repeat calls on jitter)
+    for (const [key, cached] of memoryRouteCache.entries()) {
+      if (!key.startsWith(`${destId}|`) || cached.isFallback || cached.overviewPolyline.length < 2) continue;
+      const firstPt = cached.overviewPolyline[0];
+      if (computeDistanceMeters(origin.latitude, origin.longitude, firstPt.latitude, firstPt.longitude) <= 400) {
+        return cached;
+      }
+    }
+  }
+
   const backendUrl = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
 
   if (backendUrl && !backendUrl.includes("placeholder")) {
@@ -134,19 +217,59 @@ export async function fetchTurnByTurnRoute(
           origin: { latitude: origin.latitude, longitude: origin.longitude },
           destination: { latitude: destination.lat, longitude: destination.lng },
           destination_id: destination.id,
-          routing_preference: "TRAFFIC_AWARE_OPTIMAL"
+          destination_name: destination.name,
+          waypoints: options?.waypoints?.length ? options.waypoints : undefined,
+          routing_preference: "TRAFFIC_AWARE"
         })
       });
 
       if (response.ok) {
         const liveData = await response.json();
-        if (liveData && liveData.steps && liveData.steps.length > 0) {
-          return liveData;
+        const encodedStr = typeof liveData?.encodedPolyline === 'string' ? liveData.encodedPolyline : '';
+        const decodedFromEncoded = encodedStr ? decodeEncodedPolyline(encodedStr) : [];
+        const rawOverview = sanitizePolylinePoints(liveData?.overviewPolyline);
+        const finalPolyline =
+          decodedFromEncoded.length >= rawOverview.length && decodedFromEncoded.length >= 2
+            ? decodedFromEncoded
+            : rawOverview;
+
+        const isFallback = Boolean(liveData?.isFallback) || finalPolyline.length < 2;
+        if (!isFallback || (liveData?.steps && liveData.steps.length > 0)) {
+          const normalized: RouteNavigationPayload = {
+            routeId: String(liveData.routeId || `GOOGLE-${destId}`),
+            destinationId: destination.id,
+            destinationName: destination.name || liveData.destinationName || "Delivery Stop",
+            encodedPolyline: encodedStr || undefined,
+            overviewPolyline: finalPolyline.length >= 2 ? finalPolyline : [origin, { latitude: destination.lat, longitude: destination.lng }],
+            totalDistanceMeters: Number(liveData.totalDistanceMeters || 0),
+            totalDurationSeconds: Number(liveData.totalDurationSeconds || 0),
+            steps: Array.isArray(liveData.steps) ? liveData.steps : [],
+            isFallback
+          };
+
+          if (!normalized.isFallback) {
+            memoryRouteCache.set(cacheKey, normalized);
+            setSetting(sqliteCacheKey, JSON.stringify(normalized)).catch(() => {});
+          }
+          return normalized;
         }
       }
     } catch (err) {
-      console.warn("Live Routes API unavailable, using offline calculated corridor route:", err);
+      console.warn("Live Routes API unavailable, checking offline SQLite route cache:", err);
     }
+  }
+
+  // 3. Offline SQLite fallback: return cached road polyline for this destination if available
+  try {
+    const rawSaved = await getSetting(sqliteCacheKey);
+    if (rawSaved) {
+      const saved: RouteNavigationPayload = JSON.parse(rawSaved);
+      if (saved?.overviewPolyline && saved.overviewPolyline.length >= 2 && !saved.isFallback) {
+        return saved;
+      }
+    }
+  } catch {
+    // ignore corrupt cache
   }
 
   return generateFallbackRoute(origin, destination);
@@ -155,15 +278,14 @@ export async function fetchTurnByTurnRoute(
 // Generate Traffic Bypass Route for "Recalculate Fastest Route"
 export function recalculateBypassRoute(
   currentRoute: RouteNavigationPayload,
-  driverPos: LatLng
+  _driverPos: LatLng
 ): RouteNavigationPayload {
-  const bypassSteps = currentRoute.steps.map((step, idx) => {
+  const bypassSteps = (currentRoute.steps || []).map((step, idx) => {
     if (idx === 1) {
       return {
         ...step,
-        instruction: "Turn right onto CDO Coastal Bypass Corridor to avoid congestion",
-        maneuver: "turn-right" as RouteManeuver,
-        durationSeconds: Math.max(30, Math.round(step.durationSeconds * 0.85))
+        instruction: "Follow updated fastest traffic-aware CDO corridor",
+        durationSeconds: Math.max(30, Math.round(step.durationSeconds * 0.9))
       };
     }
     return step;
@@ -171,7 +293,7 @@ export function recalculateBypassRoute(
 
   return {
     ...currentRoute,
-    totalDurationSeconds: Math.max(60, Math.round(currentRoute.totalDurationSeconds * 0.88)), // 12% faster
+    totalDurationSeconds: Math.max(60, Math.round(currentRoute.totalDurationSeconds * 0.9)),
     steps: bypassSteps
   };
 }

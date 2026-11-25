@@ -51,7 +51,11 @@ import EmergencySOS from '../components/EmergencySOS';
 import {
   queueTransaction,
   getQueuedTransactions,
-  queueFinishShift
+  queueFinishShift,
+  queueSosResolution,
+  getDismissedSosIds,
+  addDismissedSosId,
+  clearSyncedSOS
 } from '../services/DatabaseService';
 import { stopLocationTracking } from '../services/LocationService';
 import { syncDataWithServer } from '../services/SyncService';
@@ -157,6 +161,11 @@ export interface DeliveryLocationStop {
     productId?: string;
     productName?: string;
     sackSize?: string;
+    deliveredQty?: number;
+    returnedQty?: number;
+    confirmedAmount?: number;
+    confirmedMethod?: string;
+    partialReason?: string;
     isAdhoc?: boolean;
     status: 'pending' | 'completed' | 'partial' | 'cancelled';
   }>;
@@ -218,6 +227,15 @@ export default function ActiveRouteScreen({ route }: any) {
   const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
   const [showHandoverSummary, setShowHandoverSummary] = useState(false);
   const [isShiftFinished, setIsShiftFinished] = useState(false);
+  const [handoverSummary, setHandoverSummary] = useState<{
+    totalCash: number;
+    totalCharge: number;
+    chargeCount: number;
+    totalLoaded: number;
+    totalDelivered: number;
+    unsoldSacks: number;
+    remittedItems: number;
+  } | null>(null);
 
   // Extra Delivery state & Live Data
   const [showExtraDeliveryModal, setShowExtraDeliveryModal] = useState(false);
@@ -231,6 +249,22 @@ export default function ActiveRouteScreen({ route }: any) {
   const [acknowledgedSosAlert, setAcknowledgedSosAlert] = useState<any>(null);
 
   const mapRef = useRef<MapView>(null);
+  const isShiftFinishedRef = useRef(false);
+  const dismissedSosIdsRef = useRef<Set<string>>(new Set());
+  const isDismissingSosRef = useRef(false);
+  const sosDismissLockUntilRef = useRef(0);
+
+  useEffect(() => {
+    isShiftFinishedRef.current = isShiftFinished;
+  }, [isShiftFinished]);
+
+  useEffect(() => {
+    getDismissedSosIds()
+      .then(ids => {
+        ids.forEach(id => dismissedSosIdsRef.current.add(id));
+      })
+      .catch(() => { });
+  }, []);
 
   const handleSessionKicked = useCallback(
     async (reason: string = SESSION_REVOKED_MESSAGE) => {
@@ -330,9 +364,24 @@ export default function ActiveRouteScreen({ route }: any) {
         }
       }
 
+      if (isShiftFinishedRef.current) {
+        return;
+      }
+
       if (activeSlip && Array.isArray(activeSlip.load_slip_items) && activeSlip.load_slip_items.length > 0) {
         setActiveSlipId(activeSlip.id);
         setSlipNumber(activeSlip.slip_number || activeSlip.id);
+
+        // Merge unsynced local SQLite transactions so handover/totals remain accurate offline
+        const pendingQueued = await getQueuedTransactions().catch(() => []);
+        const queuedByStopId = new Map<string, any>();
+        const adhocQueued: any[] = [];
+        pendingQueued.forEach((tx: any) => {
+          if (tx.stop_id) queuedByStopId.set(String(tx.stop_id), tx);
+          if (tx.is_adhoc && (!tx.load_slip_id || tx.load_slip_id === activeSlip.id)) {
+            adhocQueued.push(tx);
+          }
+        });
 
         const hubMap = new Map<string, DeliveryLocationStop>();
         activeSlip.load_slip_items.forEach((item: any) => {
@@ -359,21 +408,42 @@ export default function ActiveRouteScreen({ route }: any) {
               customers: []
             });
           }
+
+          const queuedTx = queuedByStopId.get(String(item.id));
           const plannedQty = Number(item.planned_qty || 0);
-          const deliveredQty = Number(item.delivered_qty || 0);
+          const deliveredQty = queuedTx
+            ? Number(queuedTx.delivered_qty ?? 0)
+            : Number(item.delivered_qty ?? 0);
+          const returnedQty = queuedTx
+            ? Number(queuedTx.returned_qty ?? Math.max(0, plannedQty - deliveredQty))
+            : Number(item.returned_qty ?? Math.max(0, plannedQty - deliveredQty));
+          const unitPrice = Number(item.unit_price ?? queuedTx?.unit_price ?? 0);
           const itemStatus = String(item.status || "").toLowerCase();
           const isDone =
+            Boolean(queuedTx) ||
             itemStatus === "completed" ||
             itemStatus === "partial" ||
+            item.delivered_at != null ||
             (plannedQty > 0 && deliveredQty >= plannedQty);
+
+          const rawPay = queuedTx?.payment_method ?? item.payment_mode ?? "Cash";
+          const normalizedMethod = String(rawPay).toLowerCase().includes("charge") ? "charge" : "cash";
+          const computedAmt = unitPrice > 0 ? Math.round(deliveredQty * Math.round(unitPrice * 100)) / 100 : Number(item.total_amount ?? 0);
+          const confirmedAmount = queuedTx
+            ? Number(queuedTx.total_amount ?? computedAmt)
+            : Number(item.total_amount ?? computedAmt);
 
           hubMap.get(hubId)!.customers.push({
             id: item.id,
             name: item.customer_name,
             type: item.product_name || "Ice Drop",
             plannedQty,
-            unitPrice: Number(item.unit_price ?? 0),
-            amount: Number(item.total_amount ?? plannedQty * Number(item.unit_price ?? 0)),
+            unitPrice,
+            amount: Number(item.total_amount ?? plannedQty * unitPrice),
+            deliveredQty: isDone ? deliveredQty : undefined,
+            returnedQty: isDone ? returnedQty : undefined,
+            confirmedAmount: isDone ? confirmedAmount : undefined,
+            confirmedMethod: isDone ? normalizedMethod : undefined,
             isInstitutional: false,
             loadSlipId: activeSlip.id,
             hubId,
@@ -383,6 +453,52 @@ export default function ActiveRouteScreen({ route }: any) {
             sackSize: item.sack_size || "Standard Sack",
             isAdhoc: Boolean(item.is_adhoc),
             status: isDone ? 'completed' : 'pending'
+          });
+        });
+
+        // Include unsynced offline adhoc drops if not yet in activeSlip items
+        adhocQueued.forEach((tx: any) => {
+          const alreadyExists = Array.from(hubMap.values()).some(h =>
+            h.customers.some(c => c.id === tx.stop_id)
+          );
+          if (alreadyExists) return;
+          const hubId = tx.hub_id || Array.from(hubMap.keys())[0] || "HUB-EXTRA";
+          if (!hubMap.has(hubId)) {
+            hubMap.set(hubId, {
+              id: hubId,
+              index: hubMap.size + 1,
+              name: tx.hub_name || "Extra Delivery Hub",
+              address: "Cagayan de Oro City",
+              lat: 8.4828,
+              lng: 124.6612,
+              isInstitutionalHub: false,
+              nextManeuver: `Proceed to ${tx.hub_name || "Delivery Hub"}`,
+              etaMins: 5,
+              distanceKm: 1.2,
+              customers: []
+            });
+          }
+          const payStr = String(tx.payment_method || "cash").toLowerCase();
+          hubMap.get(hubId)!.customers.push({
+            id: tx.stop_id,
+            name: tx.customer_name,
+            type: tx.product_name || "Extra Delivery",
+            plannedQty: Number(tx.planned_qty || tx.delivered_qty || 0),
+            unitPrice: Number(tx.unit_price || 0),
+            amount: Number(tx.total_amount || 0),
+            deliveredQty: Number(tx.delivered_qty || 0),
+            returnedQty: Number(tx.returned_qty || 0),
+            confirmedAmount: Number(tx.total_amount || 0),
+            confirmedMethod: payStr.includes("charge") ? "charge" : "cash",
+            isInstitutional: false,
+            loadSlipId: activeSlip.id,
+            hubId,
+            hubName: tx.hub_name || "Delivery Hub",
+            productId: tx.product_id || undefined,
+            productName: tx.product_name || "Ice Product",
+            sackSize: tx.sack_size || "Standard Sack",
+            isAdhoc: true,
+            status: 'completed'
           });
         });
 
@@ -477,27 +593,99 @@ export default function ActiveRouteScreen({ route }: any) {
   useEffect(() => {
     const backendUrl = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
     const checkSosStatus = async () => {
+      if (isDismissingSosRef.current || Date.now() < sosDismissLockUntilRef.current) {
+        return;
+      }
+      const pollStartedAt = Date.now();
       try {
         const res = await fetch(`${backendUrl}/api/v1/telemetry/sos/active`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data && data.alerts && Array.isArray(data.alerts)) {
-            const myAck = data.alerts.find((a: any) =>
-              (a.truck_id === driver.truckId || a.driver_id === driver.id || a.driver_id === driver.name) &&
-              a.status === 'Acknowledged'
-            );
-            if (myAck) {
-              setAcknowledgedSosAlert(myAck);
-            }
-          }
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Ignore stale poll response if driver pressed dismiss while request was in flight
+        if (
+          isDismissingSosRef.current ||
+          Date.now() < sosDismissLockUntilRef.current ||
+          pollStartedAt < sosDismissLockUntilRef.current
+        ) {
+          return;
         }
+
+        const alerts = Array.isArray(data?.alerts) ? data.alerts : [];
+        const myAck = alerts.find((a: any) => {
+          const alertId = String(a?.id || a?.idempotency_key || "");
+          const alertKey = String(a?.idempotency_key || alertId);
+          const statusNorm = String(a?.status || "").trim().toUpperCase();
+          if (!alertId || statusNorm === "RESOLVED" || statusNorm === "DISMISSED") return false;
+          if (dismissedSosIdsRef.current.has(alertId) || dismissedSosIdsRef.current.has(alertKey)) {
+            return false;
+          }
+          const matchesDriver =
+            a.truck_id === driver.truckId ||
+            a.driver_id === driver.id ||
+            a.driver_id === driver.name;
+          return matchesDriver && statusNorm === "ACKNOWLEDGED";
+        });
+
+        setAcknowledgedSosAlert(myAck || null);
       } catch (_) { }
     };
 
     checkSosStatus();
     const interval = setInterval(checkSosStatus, 3500);
     return () => clearInterval(interval);
-  }, [driver.truckId, driver.id]);
+  }, [driver.truckId, driver.id, driver.name]);
+
+  const handleDismissAcknowledgedSos = useCallback(async () => {
+    const target = acknowledgedSosAlert;
+    const alertId = String(target?.id || target?.idempotency_key || "");
+    const idemKey = String(target?.idempotency_key || alertId || `RESOLVE-${Date.now()}`);
+
+    // 1. Acquire local dismissal lock and remember dismissed ID immediately
+    isDismissingSosRef.current = true;
+    sosDismissLockUntilRef.current = Date.now() + 15000;
+    if (alertId) dismissedSosIdsRef.current.add(alertId);
+    if (idemKey) dismissedSosIdsRef.current.add(idemKey);
+    setAcknowledgedSosAlert(null);
+
+    if (alertId) await addDismissedSosId(alertId);
+    if (idemKey && idemKey !== alertId) await addDismissedSosId(idemKey);
+    if (idemKey) await clearSyncedSOS([idemKey]);
+
+    // 2. Persist resolution to backend (or queue offline in SQLite if disconnected)
+    let resolvedOnBackend = false;
+    try {
+      const headers = await getSessionHeaders();
+      const res = await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/resolve`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          alert_id: alertId || undefined,
+          idempotency_key: idemKey,
+          driver_id: driver.id,
+          truck_id: driver.truckId,
+          load_slip_id: activeSlipId || undefined,
+          resolved_by: driver.name || driver.id || "Driver"
+        })
+      });
+      resolvedOnBackend = res.ok;
+    } catch {
+      resolvedOnBackend = false;
+    }
+
+    if (!resolvedOnBackend) {
+      await queueSosResolution({
+        idempotencyKey: idemKey,
+        alertId: alertId || undefined,
+        driverId: driver.id,
+        truckId: driver.truckId,
+        loadSlipId: activeSlipId || undefined,
+        resolvedBy: driver.name || driver.id || "Driver"
+      });
+    }
+
+    isDismissingSosRef.current = false;
+  }, [acknowledgedSosAlert, activeSlipId, driver.id, driver.name, driver.truckId]);
 
   // Poll offline queue & watch position
   useEffect(() => {
@@ -588,27 +776,34 @@ export default function ActiveRouteScreen({ route }: any) {
     let loaded = 0;
     let delivered = 0;
     let returned = 0;
-    let cash = 0;
-    let charge = 0;
+    let cashCents = 0;
+    let chargeCents = 0;
     let chargeInvoices = 0;
 
     locations.forEach(loc => {
       loc.customers.forEach(c => {
-        loaded += c.plannedQty;
+        const planned = Number(c.plannedQty || 0);
+        loaded += planned;
         if (c.status === 'completed') {
-          const del = (c as any).deliveredQty ?? c.plannedQty;
-          const ret = (c as any).returnedQty ?? 0;
-          const amt = (c as any).confirmedAmount ?? c.amount;
-          const method = (c as any).confirmedMethod ?? 'cash';
+          const del = Number((c as any).deliveredQty ?? planned);
+          const ret = Number((c as any).returnedQty ?? Math.max(0, planned - del));
+          const price = Number((c as any).final_price ?? (c as any).negotiated_price ?? c.unitPrice ?? 0);
+          const computedAmt = Math.round(del * Math.round(price * 100)) / 100;
+          const amt = Number((c as any).confirmedAmount ?? (computedAmt > 0 ? computedAmt : c.amount) ?? 0);
+          const amtCents = Math.round(amt * 100);
+          const methodNorm = String((c as any).confirmedMethod ?? (c as any).paymentMethod ?? 'cash').trim().toLowerCase();
+          const isCharge = methodNorm.includes('charge');
 
           delivered += del;
           returned += ret;
 
-          if (method === 'cash') {
-            cash += amt;
+          if (isCharge) {
+            chargeCents += amtCents;
+            if (del > 0 || amtCents > 0) {
+              chargeInvoices += 1;
+            }
           } else {
-            charge += amt;
-            chargeInvoices += 1;
+            cashCents += amtCents;
           }
         }
       });
@@ -618,8 +813,8 @@ export default function ActiveRouteScreen({ route }: any) {
       totalLoaded: loaded,
       totalDelivered: delivered,
       totalReturned: returned,
-      totalCashRevenue: cash,
-      totalChargeRevenue: charge,
+      totalCashRevenue: cashCents / 100,
+      totalChargeRevenue: chargeCents / 100,
       chargeCount: chargeInvoices
     };
   }, [locations]);
@@ -761,28 +956,20 @@ export default function ActiveRouteScreen({ route }: any) {
     return `${distToNextWaypointMeters} m`;
   }, [distToNextWaypointMeters]);
 
-  // Road polyline for live navigation: from driver's current position to destination
+  // Road polyline for live navigation: prefers Google Routes road polyline, falling back strictly when offline
   const dynamicNavPolyline = useMemo(() => {
     if (!activeTarget || locations.length === 0) return [];
+    if (activeNavRoute?.overviewPolyline && activeNavRoute.overviewPolyline.length >= 2) {
+      return activeNavRoute.overviewPolyline;
+    }
     const start = { latitude: driverPos.latitude, longitude: driverPos.longitude };
     const dest = { latitude: activeTarget.lat, longitude: activeTarget.lng };
-
-    if (routeBypassActive) {
-      // Traffic bypass corridor waypoint
-      const mid = {
-        latitude: (start.latitude + dest.latitude) / 2 + 0.0015,
-        longitude: (start.longitude + dest.longitude) / 2 - 0.002
-      };
-      return [start, mid, dest];
-    }
-
-    // Direct road snapped corridor
     const mid = {
       latitude: (start.latitude + dest.latitude) / 2,
       longitude: (start.longitude + dest.longitude) / 2
     };
     return [start, mid, dest];
-  }, [driverPos.latitude, driverPos.longitude, activeTarget, routeBypassActive]);
+  }, [activeNavRoute, driverPos.latitude, driverPos.longitude, activeTarget, locations.length]);
 
   // Switch to in-app Directions Map and focus destination
   const focusLocationOnInAppMap = (loc: DeliveryLocationStop) => {
@@ -833,7 +1020,7 @@ export default function ActiveRouteScreen({ route }: any) {
       // Use driverPos
     }
 
-    // Fetch standardized Route Navigation payload (FastAPI / Routes API v2 or local mock)
+    // Fetch standardized Route Navigation payload (FastAPI / Routes API v2 with local road cache)
     try {
       const routeData = await fetchTurnByTurnRoute(originPos, loc);
       setActiveNavRoute(routeData);
@@ -853,20 +1040,28 @@ export default function ActiveRouteScreen({ route }: any) {
   };
 
   // Recalculate route to bypass traffic / obstacles
-  const handleRecalculateRoute = () => {
+  const handleRecalculateRoute = async () => {
     setIsRecalculating(true);
-    setTimeout(() => {
+    try {
       setRouteBypassActive(true);
-      if (activeNavRoute) {
-        const bypassed = recalculateBypassRoute(activeNavRoute, driverPos);
-        setActiveNavRoute(bypassed);
+      if (activeTarget) {
+        const refreshed = await fetchTurnByTurnRoute(driverPos, activeTarget, { forceRefresh: true });
+        setActiveNavRoute(refreshed);
+        setCurrentStepIndex(0);
+      } else if (activeNavRoute) {
+        setActiveNavRoute(recalculateBypassRoute(activeNavRoute, driverPos));
       }
-      setIsRecalculating(false);
       Alert.alert(
         "Fastest Route Recalculated",
-        "Traffic bypass applied via secondary CDO arterial corridor. ETA updated."
+        "Traffic-aware road corridor updated from your current GPS position."
       );
-    }, 500);
+    } catch {
+      if (activeNavRoute) {
+        setActiveNavRoute(recalculateBypassRoute(activeNavRoute, driverPos));
+      }
+    } finally {
+      setIsRecalculating(false);
+    }
   };
 
   // Exit navigation mode cleanly
@@ -899,6 +1094,84 @@ export default function ActiveRouteScreen({ route }: any) {
   // Handle End-of-Shift "Complete Delivery Route"
   const handleConfirmCompleteRoute = async () => {
     setShowCompleteConfirm(false);
+
+    // 0. Compute authoritative local handover summary BEFORE syncing/clearing or mutating slip status
+    const queuedTxs = await getQueuedTransactions().catch(() => []);
+    const queuedByStopId = new Map<string, any>();
+    const adhocQueued: any[] = [];
+    queuedTxs.forEach((tx: any) => {
+      if (tx.stop_id) queuedByStopId.set(String(tx.stop_id), tx);
+      if (tx.is_adhoc && (!tx.load_slip_id || !activeSlipId || tx.load_slip_id === activeSlipId)) {
+        adhocQueued.push(tx);
+      }
+    });
+
+    let snapLoaded = 0;
+    let snapDelivered = 0;
+    let snapCashCents = 0;
+    let snapChargeCents = 0;
+    let snapChargeCount = 0;
+    let snapRemitted = 0;
+    const seenStopIds = new Set<string>();
+
+    locations.forEach(loc => {
+      loc.customers.forEach((c: any) => {
+        seenStopIds.add(String(c.id));
+        const tx = queuedByStopId.get(String(c.id));
+        const planned = Number(c.plannedQty ?? tx?.planned_qty ?? 0);
+        snapLoaded += planned;
+
+        const isDone = c.status === 'completed' || Boolean(tx);
+        if (isDone) {
+          snapRemitted += 1;
+          const del = Number(tx?.delivered_qty ?? c.deliveredQty ?? planned);
+          const price = Number(c.final_price ?? c.negotiated_price ?? tx?.unit_price ?? c.unitPrice ?? 0);
+          const computedAmt = Math.round(del * Math.round(price * 100)) / 100;
+          const amt = Number(tx?.total_amount ?? c.confirmedAmount ?? (computedAmt > 0 ? computedAmt : c.amount) ?? 0);
+          const amtCents = Math.round(amt * 100);
+          const payStr = String(tx?.payment_method ?? c.confirmedMethod ?? c.paymentMethod ?? 'cash').trim().toLowerCase();
+
+          snapDelivered += del;
+          if (payStr.includes('charge')) {
+            snapChargeCents += amtCents;
+            if (del > 0 || amtCents > 0) snapChargeCount += 1;
+          } else {
+            snapCashCents += amtCents;
+          }
+        }
+      });
+    });
+
+    adhocQueued.forEach((tx: any) => {
+      if (seenStopIds.has(String(tx.stop_id))) return;
+      const planned = Number(tx.planned_qty ?? tx.delivered_qty ?? 0);
+      const del = Number(tx.delivered_qty ?? 0);
+      const amtCents = Math.round(Number(tx.total_amount ?? 0) * 100);
+      const payStr = String(tx.payment_method ?? 'cash').trim().toLowerCase();
+      snapLoaded += planned;
+      snapDelivered += del;
+      snapRemitted += 1;
+      if (payStr.includes('charge')) {
+        snapChargeCents += amtCents;
+        if (del > 0 || amtCents > 0) snapChargeCount += 1;
+      } else {
+        snapCashCents += amtCents;
+      }
+    });
+
+    const localSnapshot = {
+      totalCash: snapCashCents / 100,
+      totalCharge: snapChargeCents / 100,
+      chargeCount: snapChargeCount,
+      totalLoaded: snapLoaded,
+      totalDelivered: snapDelivered,
+      unsoldSacks: Math.max(0, snapLoaded - snapDelivered),
+      remittedItems: snapRemitted
+    };
+
+    // Persist snapshot immediately so Realtime status->DELIVERY_FINISHED never zeroes out the modal
+    setHandoverSummary(localSnapshot);
+    isShiftFinishedRef.current = true;
     setIsShiftFinished(true);
 
     // 1. Immediately stop background GPS updates
@@ -907,7 +1180,7 @@ export default function ActiveRouteScreen({ route }: any) {
     // 2. Trigger final offline queue upload flush
     await syncDataWithServer(activeSlipId || undefined);
 
-    // 3. Mark active Load Slip as DELIVERY_FINISHED on backend (appearing in Shift Closing & Remit)
+    // 3. Mark active Load Slip as DELIVERY_FINISHED on backend & merge authoritative server summary
     if (activeSlipId) {
       let finishedSynced = false;
       try {
@@ -924,6 +1197,32 @@ export default function ActiveRouteScreen({ route }: any) {
           }
         );
         finishedSynced = res.ok;
+        if (res.ok) {
+          const json = await res.json().catch(() => null);
+          const srv = json?.handover_summary;
+          if (srv && typeof srv === 'object') {
+            const srvCash = Number(srv.total_cash ?? 0);
+            const srvCharge = Number(srv.total_charge_invoice ?? 0);
+            const srvDelivered = Number(srv.total_delivered_sacks ?? 0);
+            const srvLoaded = Number(srv.total_loaded_sacks ?? 0);
+            const srvUnsold = Number(srv.unsold_sacks ?? Math.max(0, srvLoaded - srvDelivered));
+            const srvChargeCount = Number(srv.charge_count ?? 0);
+            const srvRemitted = Number(srv.remitted_items ?? 0);
+
+            // Use authoritative server totals whenever server reflects items (or local was empty)
+            if (srvLoaded > 0 || localSnapshot.totalLoaded === 0) {
+              setHandoverSummary({
+                totalCash: srvCash > 0 || localSnapshot.totalCash === 0 ? srvCash : localSnapshot.totalCash,
+                totalCharge: srvCharge > 0 || localSnapshot.totalCharge === 0 ? srvCharge : localSnapshot.totalCharge,
+                chargeCount: srvChargeCount > 0 || localSnapshot.chargeCount === 0 ? srvChargeCount : localSnapshot.chargeCount,
+                totalLoaded: Math.max(srvLoaded, localSnapshot.totalLoaded),
+                totalDelivered: srvDelivered > 0 || localSnapshot.totalDelivered === 0 ? srvDelivered : localSnapshot.totalDelivered,
+                unsoldSacks: srvDelivered > 0 || srvLoaded > 0 ? srvUnsold : localSnapshot.unsoldSacks,
+                remittedItems: Math.max(srvRemitted, localSnapshot.remittedItems)
+              });
+            }
+          }
+        }
       } catch {
         finishedSynced = false;
       }
@@ -1166,7 +1465,7 @@ export default function ActiveRouteScreen({ route }: any) {
           </View>
           <TouchableOpacity
             style={styles.sosAckDismissBtn}
-            onPress={() => setAcknowledgedSosAlert(null)}
+            onPress={handleDismissAcknowledgedSos}
           >
             <Text style={styles.sosAckDismissText}>I Am Safe / Dismiss</Text>
           </TouchableOpacity>
@@ -1307,10 +1606,17 @@ export default function ActiveRouteScreen({ route }: any) {
                   </Text>
                   <View style={styles.navLiveMetricsRow}>
                     <Text style={styles.navLiveMetricsText}>
-                      Trip: {liveDistanceKm} km • ~{dynamicEtaMins} mins
+                      Trip:{' '}
+                      {activeNavRoute && !activeNavRoute.isFallback && activeNavRoute.totalDistanceMeters > 0
+                        ? `${(activeNavRoute.totalDistanceMeters / 1000).toFixed(1)} km • ~${Math.max(1, Math.round(activeNavRoute.totalDurationSeconds / 60))} mins`
+                        : `${liveDistanceKm} km • ~${dynamicEtaMins} mins`}
                     </Text>
                     <Text style={styles.navLiveTrafficText}>
-                      {routeBypassActive ? "⚡ Coastal bypass" : "🟢 CDO Normal Flow"}
+                      {activeNavRoute?.isFallback
+                        ? "⚠ Offline Direct Line"
+                        : routeBypassActive
+                          ? "⚡ Fastest Traffic Route"
+                          : "🟢 Road Route Active"}
                     </Text>
                   </View>
                 </View>
@@ -1422,19 +1728,22 @@ export default function ActiveRouteScreen({ route }: any) {
             showsTraffic={false}
             onTouchStart={() => setIsFollowingDriver(false)}
           >
-            {/* Road-snapped Polyline: drawn strictly when stops exist and route is loaded */}
-            {locations.length > 0 && (
-              isNavigating && activeNavRoute?.overviewPolyline && activeNavRoute.overviewPolyline.length > 0 ? (
+            {/* Road-snapped Polyline: prefers decoded Google Routes road coordinates; straight dashed fallback strictly offline */}
+            {locations.length > 0 && isNavigating && (
+              activeNavRoute?.overviewPolyline && activeNavRoute.overviewPolyline.length >= 2 && !activeNavRoute.isFallback ? (
                 <Polyline
                   coordinates={activeNavRoute.overviewPolyline}
                   strokeColor={routeBypassActive ? "#2563eb" : "#00875A"}
                   strokeWidth={5}
+                  lineCap="round"
+                  lineJoin="round"
                 />
-              ) : isNavigating && dynamicNavPolyline.length > 0 ? (
+              ) : dynamicNavPolyline.length >= 2 ? (
                 <Polyline
                   coordinates={dynamicNavPolyline}
-                  strokeColor="#2563eb"
-                  strokeWidth={5}
+                  strokeColor="#64748b"
+                  strokeWidth={4}
+                  lineDashPattern={[8, 6]}
                 />
               ) : null
             )}
@@ -1604,7 +1913,7 @@ export default function ActiveRouteScreen({ route }: any) {
                   <Text style={styles.metricRowTitle}>Total Cash to Remit to Safe</Text>
                 </View>
                 <Text style={styles.metricCashValue}>
-                  ₱ {totalCashRevenue.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                  ₱ {(handoverSummary?.totalCash ?? totalCashRevenue).toLocaleString(undefined, { minimumFractionDigits: 2 })}
                 </Text>
               </View>
 
@@ -1615,7 +1924,7 @@ export default function ActiveRouteScreen({ route }: any) {
                   <Text style={styles.metricRowTitle}>Charge Invoices Signed</Text>
                 </View>
                 <Text style={styles.metricChargeValue}>
-                  {chargeCount} invoices (₱ {totalChargeRevenue.toLocaleString(undefined, { minimumFractionDigits: 2 })})
+                  {handoverSummary?.chargeCount ?? chargeCount} invoices (₱ {(handoverSummary?.totalCharge ?? totalChargeRevenue).toLocaleString(undefined, { minimumFractionDigits: 2 })})
                 </Text>
               </View>
 
@@ -1626,7 +1935,7 @@ export default function ActiveRouteScreen({ route }: any) {
                   <Text style={styles.metricRowTitle}>Unsold Sacks to Cold Storage</Text>
                 </View>
                 <Text style={styles.metricRestockValue}>
-                  {sacksRemainingOnTruck} sacks to unload
+                  {handoverSummary?.unsoldSacks ?? sacksRemainingOnTruck} sacks to unload
                 </Text>
               </View>
             </View>

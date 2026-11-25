@@ -8,6 +8,9 @@ import {
   clearSyncedSOS,
   getQueuedFinishShifts,
   clearQueuedFinishShift,
+  getQueuedSosResolutions,
+  clearSyncedSosResolutions,
+  getDismissedSosIds,
   getSetting
 } from "./DatabaseService";
 import { BACKEND_URL, getSessionHeaders, notifySessionRevoked, SESSION_REVOKED_MESSAGE } from "./SessionService";
@@ -47,11 +50,47 @@ export const syncDataWithServer = async (
     const truckId = driver?.truckId || driver?.assigned_truck_id || undefined;
     const driverName = driver?.name || driver?.full_name || "Driver";
 
+    // 0. Flush queued SOS Resolutions first so resolved alerts are never resurrected
+    const sosResolutions = await getQueuedSosResolutions();
+    if (sosResolutions.length > 0) {
+      const confirmedResKeys: string[] = [];
+      for (const r of sosResolutions) {
+        try {
+          const res = await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/resolve`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              alert_id: r.alert_id || r.idempotency_key,
+              idempotency_key: r.idempotency_key,
+              driver_id: r.driver_id || driverId || undefined,
+              truck_id: r.truck_id || truckId || undefined,
+              load_slip_id: r.load_slip_id || activeLoadSlipId || undefined,
+              resolved_by: r.resolved_by || driverName || "Driver"
+            })
+          });
+          if (res.ok) {
+            confirmedResKeys.push(r.idempotency_key);
+          }
+        } catch {
+          // Keep queued for next reconnect
+        }
+      }
+      if (confirmedResKeys.length > 0) {
+        await clearSyncedSosResolutions(confirmedResKeys);
+      }
+    }
+
     // 1. Flush pending SOS alerts immediately with deduplicated idempotency keys
+    const dismissedSosIds = new Set(await getDismissedSosIds());
     const sosList = await getQueuedSOS();
     if (sosList.length > 0) {
       const confirmedSosKeys: string[] = [];
+      const skippedDismissedKeys: string[] = [];
       for (const sos of sosList) {
+        if (dismissedSosIds.has(String(sos.idempotency_key))) {
+          skippedDismissedKeys.push(sos.idempotency_key);
+          continue;
+        }
         try {
           const res = await fetch(`${BACKEND_URL}/api/v1/telemetry/sos`, {
             method: "POST",
@@ -74,8 +113,9 @@ export const syncDataWithServer = async (
           // Keep in SQLite for next retry
         }
       }
-      if (confirmedSosKeys.length > 0) {
-        await clearSyncedSOS(confirmedSosKeys);
+      const toClear = [...confirmedSosKeys, ...skippedDismissedKeys];
+      if (toClear.length > 0) {
+        await clearSyncedSOS(toClear);
         syncedSos = confirmedSosKeys.length;
       }
     }
@@ -193,13 +233,13 @@ export const startNetworkListener = (): (() => void) => {
   networkUnsubscribe = NetInfo.addEventListener(state => {
     const online = Boolean(state.isConnected);
     if (online && !wasConnected) {
-      syncDataWithServer().catch(() => {});
+      syncDataWithServer().catch(() => { });
     }
     wasConnected = online;
   });
 
   // Initial opportunistic flush on app launch
-  syncDataWithServer().catch(() => {});
+  syncDataWithServer().catch(() => { });
 
   return () => {
     if (networkUnsubscribe) {

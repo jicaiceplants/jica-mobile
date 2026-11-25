@@ -95,7 +95,7 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
       Alert.alert(
         "EMERGENCY ALERT BROADCASTED",
         `Dispatch & Fleet Management at Gusa Depot have been notified immediately.\n\n• Reason: ${reason}\n• Vehicle: ${truckId || 'Unassigned'}\n• Driver: ${driverName}\n• GPS: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}\n• Logged At: ${nowManila} (Asia/Manila)\n\nPlease remain in a safe location with the vehicle. Assistance is on the way.`,
-        [{ text: "I Am Safe / Acknowledge", style: "default" }]
+        [{ text: "OK, Stay Safe", style: "default" }]
       );
     } catch (err) {
       console.error('Error broadcasting SOS:', err);

@@ -87,6 +87,16 @@ export const initDatabase = async (): Promise<SQLite.SQLiteDatabase | null> => {
           truck_id TEXT,
           finished_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS queued_sos_resolutions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          idempotency_key TEXT UNIQUE NOT NULL,
+          alert_id TEXT,
+          driver_id TEXT,
+          truck_id TEXT,
+          load_slip_id TEXT,
+          resolved_by TEXT,
+          created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS driver_settings (
           key TEXT PRIMARY KEY,
           value TEXT
@@ -295,6 +305,77 @@ export const clearSyncedSOS = async (keys: string[]): Promise<void> => {
   } catch (e) {
     console.warn("clearSyncedSOS error:", e);
   }
+};
+
+export const queueSosResolution = async (params: {
+  idempotencyKey: string;
+  alertId?: string;
+  driverId?: string;
+  truckId?: string;
+  loadSlipId?: string;
+  resolvedBy?: string;
+}): Promise<void> => {
+  const database = await getDb();
+  if (!database) return;
+  try {
+    await database.runAsync(
+      `INSERT OR REPLACE INTO queued_sos_resolutions (
+        idempotency_key, alert_id, driver_id, truck_id, load_slip_id, resolved_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        params.idempotencyKey,
+        params.alertId || params.idempotencyKey,
+        params.driverId || null,
+        params.truckId || null,
+        params.loadSlipId || null,
+        params.resolvedBy || "Driver",
+        new Date().toISOString()
+      ]
+    );
+  } catch (e) {
+    console.warn("queueSosResolution error:", e);
+  }
+};
+
+export const getQueuedSosResolutions = async (): Promise<any[]> => {
+  const database = await getDb();
+  if (!database) return [];
+  try {
+    return await database.getAllAsync("SELECT * FROM queued_sos_resolutions ORDER BY id ASC");
+  } catch {
+    return [];
+  }
+};
+
+export const clearSyncedSosResolutions = async (keys: string[]): Promise<void> => {
+  const database = await getDb();
+  if (!database || !keys.length) return;
+  try {
+    for (const key of keys) {
+      await database.runAsync("DELETE FROM queued_sos_resolutions WHERE idempotency_key = ?", [key]);
+    }
+  } catch (e) {
+    console.warn("clearSyncedSosResolutions error:", e);
+  }
+};
+
+export const getDismissedSosIds = async (): Promise<string[]> => {
+  const raw = await getSetting("dismissed_sos_ids");
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(Boolean).map(String) : [];
+  } catch {
+    return [];
+  }
+};
+
+export const addDismissedSosId = async (alertId: string): Promise<void> => {
+  if (!alertId) return;
+  const existing = await getDismissedSosIds();
+  if (existing.includes(alertId)) return;
+  const next = [...existing.slice(-49), alertId];
+  await setSetting("dismissed_sos_ids", JSON.stringify(next));
 };
 
 export const queueFinishShift = async (
