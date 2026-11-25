@@ -1,20 +1,72 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, Modal, TextInput, Alert, ActivityIndicator } from 'react-native';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+  Image,
+  Modal,
+  TextInput,
+  Alert,
+  ActivityIndicator,
+  RefreshControl,
+  AppState
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useFocusEffect } from '@react-navigation/native';
 import { Theme } from '../constants/Theme';
-import { ClipboardList, Truck, Package, ArrowRight, Key, X, CheckCircle, Mail, RefreshCw, AlertCircle } from 'lucide-react-native';
+import {
+  ClipboardList,
+  Truck,
+  Package,
+  ArrowRight,
+  Key,
+  X,
+  CheckCircle,
+  Mail,
+  RefreshCw,
+  AlertCircle,
+  LogOut
+} from 'lucide-react-native';
 import EmergencySOS from '../components/EmergencySOS';
-import { getSetting, setSetting } from '../services/DatabaseService';
+import { getUnsyncedSummary, setSetting } from '../services/DatabaseService';
+import { syncDataWithServer } from '../services/SyncService';
 import { supabase } from '../services/SupabaseClient';
+import {
+  BACKEND_URL,
+  getManilaDateString,
+  getSessionHeaders,
+  getStoredDriver,
+  validateMobileSession,
+  logoutMobileSession,
+  subscribeSessionRevoked,
+  notifySessionRevoked,
+  isUuid,
+  SESSION_REVOKED_MESSAGE
+} from '../services/SessionService';
 
 export default function HomeScreen({ route, navigation }: any) {
-  const driver = route?.params?.driver || {
-    id: "USR-DRIVER-01",
-    name: "Joed Binson Rauto",
-    truckId: "TRK-01",
-    plate: "KAA 4821",
-    email: ""
-  };
+  const [driverState, setDriverState] = useState<any>(
+    () =>
+      route?.params?.driver || {
+        id: "",
+        name: "Driver",
+        truckId: "",
+        plate: "",
+        email: ""
+      }
+  );
+  const driver = driverState;
+  const revokedHandledRef = useRef(false);
+
+  useEffect(() => {
+    if (!driverState?.id) {
+      getStoredDriver().then(saved => {
+        if (saved) setDriverState(saved);
+      });
+    }
+  }, [driverState?.id]);
 
   const [isLoading, setIsLoading] = useState(false);
   const [todayLoadSlip, setTodayLoadSlip] = useState<any>(null);
@@ -35,36 +87,90 @@ export default function HomeScreen({ route, navigation }: any) {
   const [emailSuccess, setEmailSuccess] = useState('');
   const [isSavingEmail, setIsSavingEmail] = useState(false);
 
-  const fetchTodayDispatch = async () => {
+  const handleSessionKicked = useCallback(
+    async (reason: string = SESSION_REVOKED_MESSAGE) => {
+      if (revokedHandledRef.current) return;
+      revokedHandledRef.current = true;
+      await logoutMobileSession(driver);
+      Alert.alert("Session Signed Out", reason, [
+        {
+          text: "OK",
+          onPress: () => navigation.replace('Login', { notice: reason })
+        }
+      ]);
+      navigation.replace('Login', { notice: reason });
+    },
+    [driver, navigation]
+  );
+
+  const fetchTodayDispatch = useCallback(async () => {
+    if (!driver?.id && !driver?.truckId) return;
     setIsLoading(true);
     try {
-      // 1. Fetch latest email from user_accounts
-      if (driver.id) {
+      // 1. Fetch latest email if valid UUID
+      if (isUuid(driver.id)) {
         const { data: uData } = await supabase
           .from("user_accounts")
-          .select("email")
+          .select("email, assigned_truck_id")
           .eq("id", driver.id)
           .limit(1);
-        if (uData && uData.length > 0 && uData[0].email) {
-          setDriverEmail(uData[0].email);
+        if (uData && uData.length > 0) {
+          if (uData[0].email) setDriverEmail(uData[0].email);
+          if (uData[0].assigned_truck_id && uData[0].assigned_truck_id !== driver.truckId) {
+            setDriverState((prev: any) => ({ ...prev, truckId: uData[0].assigned_truck_id }));
+          }
         }
       }
 
-      // 2. Fetch today's load slip (strictly Asia/Manila date)
-      const manilaFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
-      const todayStr = manilaFormatter.format(new Date());
+      const todayStr = getManilaDateString();
 
-      const { data, error } = await supabase
+      // 2. Try FastAPI backend first (handles Manila date, UUID safety, and priority sorting)
+      try {
+        const headers = await getSessionHeaders();
+        const url = `${BACKEND_URL}/api/v1/driver/active-dispatch?driver_id=${encodeURIComponent(
+          driver.id || ""
+        )}&truck_id=${encodeURIComponent(driver.truckId || "")}&shift_date=${todayStr}`;
+        const res = await fetch(url, { headers });
+        if (res.ok) {
+          const json = await res.json();
+          if (json?.active_dispatch && json.active_dispatch.load_slip_items?.length > 0) {
+            setTodayLoadSlip(json.active_dispatch);
+            return;
+          }
+          setTodayLoadSlip(null);
+          return;
+        }
+      } catch {
+        // Offline fallback below
+      }
+
+      // 3. Direct Supabase fallback (strictly UUID-safe OR filters)
+      let query = supabase
         .from("load_slips")
         .select("*, load_slip_items(*, delivery_hubs(*))")
         .is("deleted_at", null)
-        .eq("date", todayStr)
-        .or(`truck_id.eq.${driver.truckId},driver_id.eq.${driver.id}`)
         .order("created_at", { ascending: false })
-        .limit(1);
+        .limit(10);
 
-      if (!error && data && data.length > 0 && data[0].load_slip_items && data[0].load_slip_items.length > 0) {
-        setTodayLoadSlip(data[0]);
+      const orParts: string[] = [];
+      if (driver.truckId) orParts.push(`truck_id.eq.${driver.truckId}`);
+      if (isUuid(driver.id)) orParts.push(`driver_id.eq.${driver.id}`);
+      if (orParts.length > 0) {
+        query = query.or(orParts.join(","));
+      }
+
+      const { data, error } = await query;
+      if (!error && data && data.length > 0) {
+        const activeList = data.filter((s: any) => {
+          const st = String(s.status || "").toUpperCase();
+          const hasItems = Array.isArray(s.load_slip_items) && s.load_slip_items.length > 0;
+          return (
+            hasItems &&
+            ["DISPATCHED", "ACTIVE", "PENDING", "IN_TRANSIT", "IN-TRANSIT"].includes(st)
+          );
+        });
+        const matchedToday = activeList.find((s: any) => s.date === todayStr) || activeList[0] || null;
+        setTodayLoadSlip(matchedToday);
       } else {
         setTodayLoadSlip(null);
       }
@@ -74,11 +180,79 @@ export default function HomeScreen({ route, navigation }: any) {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [driver.id, driver.truckId]);
 
+  useFocusEffect(
+    useCallback(() => {
+      fetchTodayDispatch();
+      syncDataWithServer().catch(() => { });
+    }, [fetchTodayDispatch])
+  );
+
+  // Foreground resume refresh
   useEffect(() => {
-    fetchTodayDispatch();
-  }, [driver.truckId, driver.id]);
+    const sub = AppState.addEventListener("change", next => {
+      if (next === "active") {
+        fetchTodayDispatch();
+      }
+    });
+    return () => sub.remove();
+  }, [fetchTodayDispatch]);
+
+  // Supabase Realtime for instant new Load Slip notifications & Single-Session Guard
+  useEffect(() => {
+    const unsubRevoke = subscribeSessionRevoked((reason) => {
+      handleSessionKicked(reason);
+    });
+
+    const channel = supabase
+      .channel(`home-driver-live-${driver.id || "anon"}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "load_slips" },
+        () => {
+          fetchTodayDispatch();
+        }
+      );
+
+    if (isUuid(driver.id)) {
+      channel.on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "user_accounts",
+          filter: `id=eq.${driver.id}`
+        },
+        (payload: any) => {
+          const remoteToken = payload?.new?.active_session_token;
+          const localToken = driver?.session_token || driver?.active_session_token;
+          if (payload?.new?.is_active === false || payload?.new?.deleted_at) {
+            notifySessionRevoked("Your account has been deactivated.");
+            return;
+          }
+          if (localToken && remoteToken && remoteToken !== localToken) {
+            notifySessionRevoked(SESSION_REVOKED_MESSAGE);
+          }
+        }
+      );
+    }
+
+    channel.subscribe();
+
+    const sessionPoll = setInterval(async () => {
+      const check = await validateMobileSession(driver.id, driver.session_token);
+      if (!check.valid) {
+        handleSessionKicked(check.reason || SESSION_REVOKED_MESSAGE);
+      }
+    }, 8000);
+
+    return () => {
+      unsubRevoke();
+      clearInterval(sessionPoll);
+      supabase.removeChannel(channel);
+    };
+  }, [driver.id, driver.session_token, fetchTodayDispatch, handleSessionKicked]);
 
   const dispatchMetrics = useMemo(() => {
     if (!todayLoadSlip || !todayLoadSlip.load_slip_items || todayLoadSlip.load_slip_items.length === 0) {
@@ -96,10 +270,10 @@ export default function HomeScreen({ route, navigation }: any) {
     const totalSacks = items.reduce((sum: number, it: any) => sum + (it.planned_qty || 0), 0);
     const hubsSet = new Set(items.map((it: any) => it.hub_id || it.delivery_hubs?.id || it.customer_name));
 
-    // Group inventory by description or product
+    // Group inventory by product_name
     const invMap = new Map<string, number>();
     items.forEach((it: any) => {
-      const typeName = it.description || it.product_name || "Ice Sacks";
+      const typeName = it.product_name || it.ice_type || it.description || "Ice Sacks";
       invMap.set(typeName, (invMap.get(typeName) || 0) + (it.planned_qty || 0));
     });
 
@@ -123,6 +297,10 @@ export default function HomeScreen({ route, navigation }: any) {
     setPasswordError('');
     setPasswordSuccess('');
 
+    if (!currentPassword) {
+      setPasswordError("Please enter your current password or PIN.");
+      return;
+    }
     if (!newPassword || newPassword.length < 4) {
       setPasswordError("New password must be at least 4 characters.");
       return;
@@ -134,8 +312,24 @@ export default function HomeScreen({ route, navigation }: any) {
     }
 
     try {
+      const headers = await getSessionHeaders();
+      const res = await fetch(`${BACKEND_URL}/api/v1/auth/change-password`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          user_id: driver.id,
+          old_password: currentPassword,
+          new_password: newPassword
+        })
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPasswordError(json.detail || "Current password incorrect or unable to update.");
+        return;
+      }
+
       await setSetting(`driver_pass_${driver.truckId}`, newPassword);
-      setPasswordSuccess("Password updated successfully!");
+      setPasswordSuccess("Password updated across JICA system!");
       setTimeout(() => {
         setIsPasswordModalOpen(false);
         setCurrentPassword('');
@@ -144,8 +338,31 @@ export default function HomeScreen({ route, navigation }: any) {
         setPasswordSuccess('');
       }, 1500);
     } catch (e: any) {
-      setPasswordError("Could not save password. Please try again.");
+      setPasswordError("Network error updating password. Try again when online.");
     }
+  };
+
+  const handleLogoutPress = async () => {
+    const summary = await getUnsyncedSummary();
+    const hasPending = summary.totalPending > 0 || summary.gpsCount > 0;
+    const msg = hasPending
+      ? `You have ${summary.txCount} unsynced delivery drop(s) and ${summary.gpsCount} GPS log(s). We will attempt to sync before signing out.`
+      : `Sign out of ${driver.name || "Driver"} (${driver.truckId || "Fleet"}) on this phone?`;
+
+    Alert.alert(hasPending ? "Sync & Sign Out?" : "Sign Out", msg, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: hasPending ? "Sync & Sign Out" : "Sign Out",
+        style: "destructive",
+        onPress: async () => {
+          if (hasPending) {
+            await syncDataWithServer(todayLoadSlip?.id).catch(() => { });
+          }
+          await logoutMobileSession(driver);
+          navigation.replace('Login');
+        }
+      }
+    ]);
   };
 
   const handleSaveEmail = async () => {
@@ -185,24 +402,34 @@ export default function HomeScreen({ route, navigation }: any) {
   return (
     <SafeAreaView style={styles.container}>
       {/* Top Header Floating Emergency SOS */}
-      <EmergencySOS driver={driver} />
+      <EmergencySOS driver={{ ...driver, routeId: todayLoadSlip?.id }} />
 
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            refreshing={isLoading}
+            onRefresh={fetchTodayDispatch}
+            colors={[Theme.colors.primary]}
+          />
+        }
+      >
+
         {/* Header Card */}
         <View style={styles.headerCard}>
           <View style={styles.headerTopRow}>
-            <Image 
-              source={require('../../assets/JICA Ice Logistics Logo.png')} 
-              style={styles.headerLogo} 
-              resizeMode="contain" 
+            <Image
+              source={require('../../assets/JICA Ice Logistics Logo.png')}
+              style={styles.headerLogo}
+              resizeMode="contain"
             />
             <View style={styles.truckBadge}>
               <Truck size={15} color={Theme.colors.primaryDark} />
               <Text style={styles.truckText}>{driver.truckId}</Text>
             </View>
           </View>
-          
+
           <View style={styles.headerRow}>
             <View style={{ flex: 1, paddingRight: 40 }}>
               <Text style={styles.greeting}>Good Day, Driver</Text>
@@ -221,7 +448,7 @@ export default function HomeScreen({ route, navigation }: any) {
 
           {/* Action Pills for Driver */}
           <View style={styles.headerBottomActionRow}>
-            <TouchableOpacity 
+            <TouchableOpacity
               style={styles.actionPill}
               onPress={() => {
                 setPasswordError('');
@@ -234,7 +461,7 @@ export default function HomeScreen({ route, navigation }: any) {
               <Text style={styles.actionPillText}>Change Password</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity 
+            <TouchableOpacity
               style={[styles.actionPill, styles.actionPillSecondary]}
               onPress={() => {
                 setEmailInput(driverEmail);
@@ -247,6 +474,22 @@ export default function HomeScreen({ route, navigation }: any) {
               <Mail size={13} color="#ffffff" />
               <Text style={styles.actionPillText}>Edit Gmail</Text>
             </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.actionPill,
+                {
+                  backgroundColor: 'rgba(239, 68, 68, 0.25)',
+                  borderColor: 'rgba(252, 165, 165, 0.5)',
+                  borderWidth: 1
+                }
+              ]}
+              onPress={handleLogoutPress}
+              activeOpacity={0.8}
+            >
+              <LogOut size={13} color="#ffffff" />
+              <Text style={styles.actionPillText}>Log Out</Text>
+            </TouchableOpacity>
           </View>
         </View>
 
@@ -257,8 +500,8 @@ export default function HomeScreen({ route, navigation }: any) {
               <ClipboardList size={22} color={Theme.colors.primary} />
               <Text style={styles.sectionTitle}>Today&apos;s Dispatch Summary</Text>
             </View>
-            <TouchableOpacity 
-              style={styles.refreshIconBtn} 
+            <TouchableOpacity
+              style={styles.refreshIconBtn}
               onPress={fetchTodayDispatch}
               disabled={isLoading}
             >
@@ -287,10 +530,10 @@ export default function HomeScreen({ route, navigation }: any) {
           {dispatchMetrics.hasDispatch ? (
             <View style={styles.inventoryCard}>
               {dispatchMetrics.inventory.map((item, index) => (
-                <View 
-                  key={item.id} 
+                <View
+                  key={item.id}
                   style={[
-                    styles.inventoryRow, 
+                    styles.inventoryRow,
                     index < dispatchMetrics.inventory.length - 1 && styles.borderBottom
                   ]}
                 >
@@ -331,7 +574,7 @@ export default function HomeScreen({ route, navigation }: any) {
         </View>
 
         {/* Start Route Action Button */}
-        <TouchableOpacity 
+        <TouchableOpacity
           style={[styles.actionButton, !dispatchMetrics.hasDispatch && styles.actionButtonDisabled]}
           onPress={() => navigation.navigate('ActiveRoute', { driver })}
           activeOpacity={0.85}
@@ -414,14 +657,14 @@ export default function HomeScreen({ route, navigation }: any) {
             </View>
 
             <View style={styles.modalBtnRow}>
-              <TouchableOpacity 
-                style={styles.cancelBtn} 
+              <TouchableOpacity
+                style={styles.cancelBtn}
                 onPress={() => setIsPasswordModalOpen(false)}
               >
                 <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity 
-                style={styles.saveBtn} 
+              <TouchableOpacity
+                style={styles.saveBtn}
                 onPress={handleChangePassword}
               >
                 <Text style={styles.saveBtnText}>Save Password</Text>
@@ -480,14 +723,14 @@ export default function HomeScreen({ route, navigation }: any) {
             </View>
 
             <View style={styles.modalBtnRow}>
-              <TouchableOpacity 
-                style={styles.cancelBtn} 
+              <TouchableOpacity
+                style={styles.cancelBtn}
                 onPress={() => setIsEmailModalOpen(false)}
               >
                 <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity 
-                style={styles.saveBtn} 
+              <TouchableOpacity
+                style={styles.saveBtn}
                 disabled={isSavingEmail}
                 onPress={handleSaveEmail}
               >

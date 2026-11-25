@@ -5,6 +5,7 @@ import { Theme } from '../constants/Theme';
 import { AlertTriangle, Wrench, XCircle, ShieldAlert, X, HelpCircle, CheckCircle2 } from 'lucide-react-native';
 import * as Location from 'expo-location';
 import { queueSOS } from '../services/DatabaseService';
+import { BACKEND_URL, getManilaTimeString, getSessionHeaders } from '../services/SessionService';
 
 function generateUUID(): string {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
@@ -48,33 +49,35 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
       }
 
       const idempotencyKey = generateUUID();
-      const nowManila = new Date().toLocaleString('en-US', { timeZone: 'Asia/Manila' });
+      const nowManila = getManilaTimeString();
 
-      const driverId = driver?.name || driver?.id || 'Joed Binson Rauto';
-      const truckId = driver?.truckId || 'TRK-01';
-      const loadSlipId = driver?.routeId || 'LS-20261123-01';
+      const driverId = driver?.id || driver?.name || 'driver';
+      const driverName = driver?.name || 'Assigned Driver';
+      const truckId = driver?.truckId || '';
+      const loadSlipId = driver?.routeId || null;
 
       // 2. Queue into SQLite for immediate local persistence
       await queueSOS({
         idempotencyKey,
         driverId,
+        driverName,
         truckId,
         loadSlipId,
         reason,
         latitude,
-        longitude,
-        timestamp: nowManila
+        longitude
       });
 
       // 3. Immediately broadcast to FastAPI backend if online
-      const backendUrl = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
       try {
-        await fetch(`${backendUrl}/api/v1/telemetry/sos`, {
+        const headers = await getSessionHeaders();
+        await fetch(`${BACKEND_URL}/api/v1/telemetry/sos`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
             driver_id: driverId,
-            truck_id: truckId,
+            driver_name: driverName,
+            truck_id: truckId || 'UNASSIGNED',
             load_slip_id: loadSlipId,
             latitude,
             longitude,
@@ -88,10 +91,10 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
 
       setModalVisible(false);
 
-      // 3. Display clear confirmation alert
+      // 4. Display clear confirmation alert
       Alert.alert(
         "EMERGENCY ALERT BROADCASTED",
-        `Dispatch & Fleet Management at Gusa Depot have been notified immediately.\n\n• Reason: ${reason}\n• Vehicle: ${truckId}\n• Driver: ${driverId}\n• GPS: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}\n• Logged At: ${nowManila}\n\nPlease remain in a safe location with the vehicle. Assistance is on the way.`,
+        `Dispatch & Fleet Management at Gusa Depot have been notified immediately.\n\n• Reason: ${reason}\n• Vehicle: ${truckId || 'Unassigned'}\n• Driver: ${driverName}\n• GPS: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}\n• Logged At: ${nowManila} (Asia/Manila)\n\nPlease remain in a safe location with the vehicle. Assistance is on the way.`,
         [{ text: "I Am Safe / Acknowledge", style: "default" }]
       );
     } catch (err) {
@@ -106,11 +109,11 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
   return (
     <>
       {/* Top-Right Floating Emergency SOS Button */}
-      <TouchableOpacity 
+      <TouchableOpacity
         style={[
-          styles.topRightFab, 
+          styles.topRightFab,
           { top: Math.max(insets.top, 12) + 6 }
-        ]} 
+        ]}
         onPress={() => setModalVisible(true)}
         activeOpacity={0.8}
         accessibilityLabel="Emergency SOS Alert"
@@ -137,8 +140,8 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
                   <Text style={styles.headerSub}>CDO Dispatch Rapid Response</Text>
                 </View>
               </View>
-              <TouchableOpacity 
-                onPress={() => !isSubmitting && setModalVisible(false)} 
+              <TouchableOpacity
+                onPress={() => !isSubmitting && setModalVisible(false)}
                 style={styles.closeBtn}
                 disabled={isSubmitting}
               >
@@ -148,7 +151,7 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
 
             <View style={styles.driverInfoBanner}>
               <Text style={styles.driverInfoText}>
-                Vehicle: <Text style={styles.bold}>{driver?.truckId || 'TRK-01'}</Text> • Driver: <Text style={styles.bold}>{driver?.name || 'Joed Binson Rauto'}</Text>
+                Vehicle: <Text style={styles.bold}>{driver?.truckId || 'Unassigned'}</Text> • Driver: <Text style={styles.bold}>{driver?.name || 'Driver'}</Text>
               </Text>
             </View>
 
@@ -163,8 +166,8 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
               </View>
             ) : (
               <View style={styles.optionsContainer}>
-                <TouchableOpacity 
-                  style={styles.optionButton} 
+                <TouchableOpacity
+                  style={styles.optionButton}
                   onPress={() => handleSOS('Flat Tire')}
                   activeOpacity={0.8}
                 >
@@ -174,9 +177,9 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
                     <Text style={styles.optionSub}>Tire blowout or roadside puncture</Text>
                   </View>
                 </TouchableOpacity>
-                
-                <TouchableOpacity 
-                  style={styles.optionButton} 
+
+                <TouchableOpacity
+                  style={styles.optionButton}
                   onPress={() => handleSOS('Engine Breakdown')}
                   activeOpacity={0.8}
                 >
@@ -187,8 +190,8 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
                   </View>
                 </TouchableOpacity>
 
-                <TouchableOpacity 
-                  style={styles.optionButton} 
+                <TouchableOpacity
+                  style={styles.optionButton}
                   onPress={() => handleSOS('Accident')}
                   activeOpacity={0.8}
                 >
@@ -199,8 +202,8 @@ export default function EmergencySOS({ driver }: EmergencySOSProps) {
                   </View>
                 </TouchableOpacity>
 
-                <TouchableOpacity 
-                  style={styles.optionButton} 
+                <TouchableOpacity
+                  style={styles.optionButton}
                   onPress={() => handleSOS('Other')}
                   activeOpacity={0.8}
                 >

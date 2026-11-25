@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useEffect, useRef } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -9,7 +9,9 @@ import {
   TextInput,
   ScrollView,
   Alert,
-  Dimensions
+  Dimensions,
+  RefreshControl,
+  AppState
 } from 'react-native';
 import { Theme } from '../constants/Theme';
 import {
@@ -46,12 +48,28 @@ import MapView, { Marker, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
 import CheckoutModal from '../components/CheckoutModal';
 import EmergencySOS from '../components/EmergencySOS';
-import { queueTransaction, getQueuedTransactions } from '../services/DatabaseService';
+import {
+  queueTransaction,
+  getQueuedTransactions,
+  queueFinishShift
+} from '../services/DatabaseService';
 import { stopLocationTracking } from '../services/LocationService';
 import { syncDataWithServer } from '../services/SyncService';
 import { supabase } from '../services/SupabaseClient';
+import {
+  BACKEND_URL,
+  getManilaDateString,
+  getSessionHeaders,
+  getStoredDriver,
+  validateMobileSession,
+  logoutMobileSession,
+  subscribeSessionRevoked,
+  notifySessionRevoked,
+  isUuid,
+  SESSION_REVOKED_MESSAGE
+} from '../services/SessionService';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import {
   fetchTurnByTurnRoute,
   recalculateBypassRoute,
@@ -132,13 +150,41 @@ export interface DeliveryLocationStop {
     unitPrice: number;
     amount: number;
     isInstitutional?: boolean;
+    loadSlipId?: string;
+    hubId?: string;
+    hubName?: string;
+    productId?: string;
+    productName?: string;
+    sackSize?: string;
+    isAdhoc?: boolean;
     status: 'pending' | 'completed' | 'partial' | 'cancelled';
   }>;
 }
 
 export default function ActiveRouteScreen({ route }: any) {
   const navigation = useNavigation<any>();
-  const driver = route?.params?.driver || { id: "USR-01", name: "Joed Binson Rauto", truckId: "TRK-01", plate: "KAA 4821" };
+  const [driverState, setDriverState] = useState<any>(
+    () =>
+      route?.params?.driver || {
+        id: "",
+        name: "Driver",
+        truckId: "",
+        plate: ""
+      }
+  );
+  const driver = driverState;
+  const revokedHandledRef = useRef(false);
+
+  useEffect(() => {
+    if (!driverState?.id) {
+      getStoredDriver().then(saved => {
+        if (saved) setDriverState(saved);
+      });
+    }
+  }, [driverState?.id]);
+
+  const [activeSlipId, setActiveSlipId] = useState<string | null>(null);
+  const [slipNumber, setSlipNumber] = useState<string | null>(null);
 
   const [locations, setLocations] = useState<DeliveryLocationStop[]>([]);
   const [selectedCustomer, setSelectedCustomer] = useState<any>(null);
@@ -185,10 +231,28 @@ export default function ActiveRouteScreen({ route }: any) {
 
   const mapRef = useRef<MapView>(null);
 
-  const fetchRouteFromSupabase = async () => {
+  const handleSessionKicked = useCallback(
+    async (reason: string = SESSION_REVOKED_MESSAGE) => {
+      if (revokedHandledRef.current) return;
+      revokedHandledRef.current = true;
+      stopLocationTracking();
+      await logoutMobileSession(driver);
+      Alert.alert("Session Signed Out", reason, [
+        {
+          text: "OK",
+          onPress: () => navigation.replace('Login', { notice: reason })
+        }
+      ]);
+      navigation.replace('Login', { notice: reason });
+    },
+    [driver, navigation]
+  );
+
+  const fetchRouteFromSupabase = useCallback(async () => {
+    if (!driver?.id && !driver?.truckId) return;
     setIsLoadingRoute(true);
     try {
-      // 1. Fetch live delivery hubs & products
+      // 1. Fetch live delivery hubs & products (reading canonical standard_price)
       const [{ data: hubsData }, { data: prodsData }] = await Promise.all([
         supabase.from("delivery_hubs").select("*").is("deleted_at", null).eq("is_active", true).order("name"),
         supabase.from("products").select("*").is("deleted_at", null).eq("is_active", true).order("name")
@@ -196,32 +260,74 @@ export default function ActiveRouteScreen({ route }: any) {
 
       if (hubsData && hubsData.length > 0) {
         setAvailableHubs(hubsData);
-        if (!extraLocationId) {
-          setExtraLocationId(hubsData[0].id);
-        }
+        setExtraLocationId(prev => prev || hubsData[0].id);
       }
 
       if (prodsData && prodsData.length > 0) {
         setAvailableProducts(prodsData);
-        setSelectedProductId(prodsData[0].id);
-        setExtraPrice(String(prodsData[0].price || 150));
+        setSelectedProductId(prev => prev || prodsData[0].id);
+        setExtraPrice(String(prodsData[0].standard_price ?? prodsData[0].price ?? 0));
       }
 
-      // 2. Fetch live route stops
-      const { data: slips, error } = await supabase
-        .from("load_slips")
-        .select("*, load_slip_items(*, delivery_hubs(*))")
-        .is("deleted_at", null)
-        .or(`truck_id.eq.${driver.truckId},driver_id.eq.${driver.id}`)
-        .order("created_at", { ascending: false })
-        .limit(1);
+      const todayStr = getManilaDateString();
+      let activeSlip: any = null;
 
-      if (!error && slips && slips.length > 0 && slips[0].load_slip_items && slips[0].load_slip_items.length > 0) {
+      // 2. Try FastAPI backend first
+      try {
+        const headers = await getSessionHeaders();
+        const url = `${BACKEND_URL}/api/v1/driver/active-dispatch?driver_id=${encodeURIComponent(
+          driver.id || ""
+        )}&truck_id=${encodeURIComponent(driver.truckId || "")}&shift_date=${todayStr}`;
+        const res = await fetch(url, { headers });
+        if (res.ok) {
+          const json = await res.json();
+          if (json?.active_dispatch?.load_slip_items?.length > 0) {
+            activeSlip = json.active_dispatch;
+          }
+        }
+      } catch {
+        // Fallback direct Supabase
+      }
+
+      // 3. Direct Supabase UUID-safe fallback
+      if (!activeSlip) {
+        let query = supabase
+          .from("load_slips")
+          .select("*, load_slip_items(*, delivery_hubs(*))")
+          .is("deleted_at", null)
+          .order("created_at", { ascending: false })
+          .limit(10);
+
+        const orParts: string[] = [];
+        if (driver.truckId) orParts.push(`truck_id.eq.${driver.truckId}`);
+        if (isUuid(driver.id)) orParts.push(`driver_id.eq.${driver.id}`);
+        if (orParts.length > 0) {
+          query = query.or(orParts.join(","));
+        }
+
+        const { data: slips, error } = await query;
+        if (!error && slips && slips.length > 0) {
+          const eligible = slips.filter((s: any) => {
+            const st = String(s.status || "").toUpperCase();
+            const hasItems = Array.isArray(s.load_slip_items) && s.load_slip_items.length > 0;
+            return (
+              hasItems &&
+              ["DISPATCHED", "ACTIVE", "PENDING", "IN_TRANSIT", "IN-TRANSIT"].includes(st)
+            );
+          });
+          activeSlip = eligible.find((s: any) => s.date === todayStr) || eligible[0] || null;
+        }
+      }
+
+      if (activeSlip && Array.isArray(activeSlip.load_slip_items) && activeSlip.load_slip_items.length > 0) {
+        setActiveSlipId(activeSlip.id);
+        setSlipNumber(activeSlip.slip_number || activeSlip.id);
+
         const hubMap = new Map<string, DeliveryLocationStop>();
-        slips[0].load_slip_items.forEach((item: any) => {
+        activeSlip.load_slip_items.forEach((item: any) => {
           const hub = item.delivery_hubs || {
             id: item.hub_id || `HUB-${hubMap.size + 1}`,
-            name: item.customer_name || "CDO Delivery Hub",
+            name: item.hub_name || item.customer_name || "CDO Delivery Hub",
             address: "Cagayan de Oro City",
             latitude: 8.4828,
             longitude: 124.6612
@@ -242,38 +348,119 @@ export default function ActiveRouteScreen({ route }: any) {
               customers: []
             });
           }
+          const plannedQty = Number(item.planned_qty || 0);
+          const deliveredQty = Number(item.delivered_qty || 0);
+          const itemStatus = String(item.status || "").toLowerCase();
+          const isDone =
+            itemStatus === "completed" ||
+            itemStatus === "partial" ||
+            (plannedQty > 0 && deliveredQty >= plannedQty);
+
           hubMap.get(hubId)!.customers.push({
             id: item.id,
             name: item.customer_name,
-            type: "Store",
-            plannedQty: item.planned_qty,
-            unitPrice: Number(item.unit_price) || 150,
-            amount: Number(item.total_amount) || (item.planned_qty * 150),
+            type: item.product_name || "Ice Drop",
+            plannedQty,
+            unitPrice: Number(item.unit_price ?? 0),
+            amount: Number(item.total_amount ?? plannedQty * Number(item.unit_price ?? 0)),
             isInstitutional: false,
-            status: item.delivered_qty >= item.planned_qty ? 'completed' : 'pending'
+            loadSlipId: activeSlip.id,
+            hubId,
+            hubName: hub.name || item.hub_name || "Delivery Hub",
+            productId: item.product_id || undefined,
+            productName: item.product_name || "Ice Product",
+            sackSize: item.sack_size || "Standard Sack",
+            isAdhoc: Boolean(item.is_adhoc),
+            status: isDone ? 'completed' : 'pending'
           });
         });
 
         const loaded = Array.from(hubMap.values());
         setLocations(loaded);
         if (loaded.length > 0) {
-          setSelectedMapTarget(loaded[0]);
-          if (!extraLocationId) setExtraLocationId(loaded[0].id);
+          setSelectedMapTarget(prev => prev || loaded[0]);
+          setExtraLocationId(prev => prev || loaded[0].id);
         }
       } else {
+        setActiveSlipId(null);
+        setSlipNumber(null);
         setLocations([]);
       }
     } catch (e) {
-      console.warn("Could not load route from Supabase:", e);
+      console.warn("Could not load route:", e);
       setLocations([]);
     } finally {
       setIsLoadingRoute(false);
     }
-  };
+  }, [driver.id, driver.truckId]);
+
+  useFocusEffect(
+    useCallback(() => {
+      fetchRouteFromSupabase();
+    }, [fetchRouteFromSupabase])
+  );
 
   useEffect(() => {
-    fetchRouteFromSupabase();
-  }, [driver.truckId, driver.id]);
+    const sub = AppState.addEventListener("change", next => {
+      if (next === "active") fetchRouteFromSupabase();
+    });
+    return () => sub.remove();
+  }, [fetchRouteFromSupabase]);
+
+  // Realtime sync on load_slips + Strict Single-Session Guard
+  useEffect(() => {
+    const unsubRevoke = subscribeSessionRevoked((reason) => {
+      handleSessionKicked(reason);
+    });
+
+    const channel = supabase
+      .channel(`active-route-live-${driver.id || "anon"}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "load_slips" },
+        () => {
+          fetchRouteFromSupabase();
+        }
+      );
+
+    if (isUuid(driver.id)) {
+      channel.on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "user_accounts",
+          filter: `id=eq.${driver.id}`
+        },
+        (payload: any) => {
+          const remoteToken = payload?.new?.active_session_token;
+          const localToken = driver?.session_token || driver?.active_session_token;
+          if (payload?.new?.is_active === false || payload?.new?.deleted_at) {
+            notifySessionRevoked("Your account has been deactivated.");
+            return;
+          }
+          if (localToken && remoteToken && remoteToken !== localToken) {
+            notifySessionRevoked(SESSION_REVOKED_MESSAGE);
+          }
+        }
+      );
+    }
+
+    channel.subscribe();
+
+    const sessionPoll = setInterval(async () => {
+      const check = await validateMobileSession(driver.id, driver.session_token);
+      if (!check.valid) {
+        handleSessionKicked(check.reason || SESSION_REVOKED_MESSAGE);
+      }
+    }, 8000);
+
+    return () => {
+      unsubRevoke();
+      clearInterval(sessionPoll);
+      supabase.removeChannel(channel);
+    };
+  }, [driver.id, driver.session_token, fetchRouteFromSupabase, handleSessionKicked]);
 
   // Poll for Active Emergency SOS Dispatcher Acknowledgements ("Help is on the Way")
   useEffect(() => {
@@ -475,18 +662,26 @@ export default function ActiveRouteScreen({ route }: any) {
   }) => {
     if (selectedCustomer) {
       const idempotencyKey = generateUUID();
+      const targetSlipId = selectedCustomer.loadSlipId || activeSlipId || undefined;
 
       await queueTransaction({
         idempotencyKey,
         stopId: selectedCustomer.id,
+        loadSlipId: targetSlipId,
+        hubId: selectedCustomer.hubId,
+        hubName: selectedCustomer.hubName,
         customerName: selectedCustomer.name,
+        productId: selectedCustomer.productId,
+        productName: selectedCustomer.productName || "Ice Product",
+        sackSize: selectedCustomer.sackSize || "Standard Sack",
         plannedQty: selectedCustomer.plannedQty,
         deliveredQty: result.deliveredQty,
         returnedQty: result.returnedQty,
         unitPrice: selectedCustomer.unitPrice,
         totalAmount: result.totalAmount,
         paymentMethod: result.method,
-        partialReason: result.partialReason
+        partialReason: result.partialReason,
+        isAdhoc: Boolean(selectedCustomer.isAdhoc)
       });
 
       setLocations(prev =>
@@ -509,6 +704,13 @@ export default function ActiveRouteScreen({ route }: any) {
       );
 
       setQueuedCount(prev => prev + 1);
+
+      // Immediately push to backend when online so Web Dashboard updates live
+      syncDataWithServer(targetSlipId).then(syncRes => {
+        if (!syncRes.skipped && syncRes.syncedTransactions > 0) {
+          getQueuedTransactions().then(rem => setQueuedCount(rem.length));
+        }
+      }).catch(() => { });
     }
 
     setCheckoutVisible(false);
@@ -595,6 +797,18 @@ export default function ActiveRouteScreen({ route }: any) {
     setRouteBypassActive(false);
     setCurrentStepIndex(0);
 
+    // Notify dispatcher backend that route is now IN_TRANSIT
+    if (activeSlipId) {
+      getSessionHeaders()
+        .then(headers =>
+          fetch(`${BACKEND_URL}/api/v1/load-slips/${encodeURIComponent(activeSlipId)}/start-route`, {
+            method: 'POST',
+            headers
+          })
+        )
+        .catch(() => { });
+    }
+
     let originPos = driverPos;
     try {
       const currentLoc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
@@ -680,15 +894,43 @@ export default function ActiveRouteScreen({ route }: any) {
     stopLocationTracking();
 
     // 2. Trigger final offline queue upload flush
-    await syncDataWithServer();
+    await syncDataWithServer(activeSlipId || undefined);
 
-    // 3. Display driver handover summary
+    // 3. Mark active Load Slip as DELIVERY_FINISHED on backend (appearing in Shift Closing & Remit)
+    if (activeSlipId) {
+      let finishedSynced = false;
+      try {
+        const headers = await getSessionHeaders();
+        const res = await fetch(
+          `${BACKEND_URL}/api/v1/load-slips/${encodeURIComponent(activeSlipId)}/finish-delivery`,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              driver_id: driver.id,
+              truck_id: driver.truckId
+            })
+          }
+        );
+        finishedSynced = res.ok;
+      } catch {
+        finishedSynced = false;
+      }
+
+      if (!finishedSynced) {
+        await queueFinishShift(activeSlipId, driver.id, driver.truckId);
+      }
+    }
+
+    // 4. Display driver handover summary
     setShowHandoverSummary(true);
   };
 
   // Final Logout & Return to Dispatch
-  const handleFinalHandoverLogout = () => {
+  const handleFinalHandoverLogout = async () => {
     setShowHandoverSummary(false);
+    await syncDataWithServer(activeSlipId || undefined).catch(() => { });
+    await logoutMobileSession(driver);
     navigation.replace('Login');
   };
 
@@ -701,15 +943,18 @@ export default function ActiveRouteScreen({ route }: any) {
 
     const hubPool = availableHubs.length > 0 ? availableHubs : locations;
     const targetHub = hubPool.find(h => h.id === extraLocationId) || hubPool[0];
+    const selectedProduct = availableProducts.find((p: any) => p.id === selectedProductId) || availableProducts[0];
 
     if (!targetHub) {
       Alert.alert("Delivery Hub Required", "No delivery hub selected. Please ask JICA Office Dispatch to configure hubs in Web Settings.");
       return;
     }
 
-    const qty = parseInt(extraQty) || 1;
-    const price = parseFloat(extraPrice) || 150;
-    const amount = qty * price;
+    const qty = Math.max(1, parseInt(extraQty, 10) || 1);
+    const defaultProdPrice = Number(selectedProduct?.standard_price ?? selectedProduct?.price ?? 0);
+    const parsedPrice = parseFloat(extraPrice);
+    const price = Number.isFinite(parsedPrice) && parsedPrice >= 0 ? parsedPrice : defaultProdPrice;
+    const amount = Math.round(qty * Math.round(price * 100)) / 100;
 
     const newCustomer = {
       id: `EXTRA-${Date.now()}`,
@@ -719,6 +964,13 @@ export default function ActiveRouteScreen({ route }: any) {
       unitPrice: price,
       amount,
       isInstitutional: false,
+      loadSlipId: activeSlipId || undefined,
+      hubId: targetHub.id,
+      hubName: targetHub.name,
+      productId: selectedProduct?.id,
+      productName: selectedProduct?.name || "Ice Product",
+      sackSize: selectedProduct?.sack_size || "Standard Sack",
+      isAdhoc: true,
       status: 'pending' as const
     };
 
@@ -987,6 +1239,13 @@ export default function ActiveRouteScreen({ route }: any) {
             renderItem={renderLocationGroup}
             contentContainerStyle={styles.listContent}
             showsVerticalScrollIndicator={false}
+            refreshControl={
+              <RefreshControl
+                refreshing={isLoadingRoute}
+                onRefresh={fetchRouteFromSupabase}
+                colors={[Theme.colors.primary]}
+              />
+            }
             ListEmptyComponent={
               <View style={styles.emptyContainer}>
                 <View style={styles.emptyIconCircle}>
@@ -1246,7 +1505,7 @@ export default function ActiveRouteScreen({ route }: any) {
       </View>
 
       {/* Floating Emergency SOS (Top-right corner, active after login) */}
-      <EmergencySOS driver={driver} />
+      <EmergencySOS driver={{ ...driver, routeId: activeSlipId || slipNumber || undefined }} />
 
       {/* Checkout Modal */}
       <CheckoutModal
@@ -1355,7 +1614,7 @@ export default function ActiveRouteScreen({ route }: any) {
 
             <View style={styles.complianceNote}>
               <Text style={styles.complianceNoteText}>
-                ✓ Shift marked as "Completed / Pending Remittance" on Dispatcher Web Ledger.
+                ✓ Shift marked as "Delivery Finished" — Ready for Cashier Remit.
                 {'\n'}
                 ✓ Smartphone GPS tracking has been fully deactivated.
               </Text>
@@ -1423,20 +1682,23 @@ export default function ActiveRouteScreen({ route }: any) {
                 <View style={styles.inputGroup}>
                   <Text style={styles.inputLabel}>Select Ice Product *</Text>
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.hubChipsRow}>
-                    {availableProducts.map((p: any) => (
-                      <TouchableOpacity
-                        key={p.id}
-                        style={[styles.hubChip, selectedProductId === p.id && styles.hubChipActive]}
-                        onPress={() => {
-                          setSelectedProductId(p.id);
-                          setExtraPrice(String(p.price || 150));
-                        }}
-                      >
-                        <Text style={[styles.hubChipText, selectedProductId === p.id && styles.hubChipTextActive]}>
-                          {p.name} (₱{p.price})
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
+                    {availableProducts.map((p: any) => {
+                      const prodPrice = Number(p.standard_price ?? p.price ?? 0);
+                      return (
+                        <TouchableOpacity
+                          key={p.id}
+                          style={[styles.hubChip, selectedProductId === p.id && styles.hubChipActive]}
+                          onPress={() => {
+                            setSelectedProductId(p.id);
+                            setExtraPrice(String(prodPrice));
+                          }}
+                        >
+                          <Text style={[styles.hubChipText, selectedProductId === p.id && styles.hubChipTextActive]}>
+                            {p.name} (₱{prodPrice})
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
                   </ScrollView>
                 </View>
 
@@ -1454,7 +1716,7 @@ export default function ActiveRouteScreen({ route }: any) {
                     <Text style={styles.inputLabel}>Price / Sack (₱)</Text>
                     <TextInput
                       style={styles.textInput}
-                      keyboardType="number-pad"
+                      keyboardType="decimal-pad"
                       value={extraPrice}
                       onChangeText={setExtraPrice}
                     />

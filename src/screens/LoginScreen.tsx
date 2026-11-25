@@ -1,15 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  View, 
-  Text, 
-  TextInput, 
-  TouchableOpacity, 
-  StyleSheet, 
-  KeyboardAvoidingView, 
-  Platform, 
-  Image, 
-  Modal, 
-  ScrollView 
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  StyleSheet,
+  KeyboardAvoidingView,
+  Platform,
+  Image,
+  Modal,
+  ScrollView
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Theme } from '../constants/Theme';
@@ -17,30 +17,35 @@ import { Truck, ShieldCheck, MapPin, CheckCircle, ChevronDown, User, Lock, Refre
 import * as Location from 'expo-location';
 import { getSetting, setSetting } from '../services/DatabaseService';
 import { supabase } from '../services/SupabaseClient';
+import {
+  BACKEND_URL,
+  saveDriverSession,
+  validateMobileSession,
+  clearLocalSession,
+  SESSION_REVOKED_MESSAGE
+} from '../services/SessionService';
 
-const BACKEND_URL = (process.env.EXPO_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app").replace(/\/+$/, "").trim();
-
-// Minimal Default Driver Account for Initial Setup
-const DEFAULT_ACCOUNT = {
-  id: "USR-DRIVER-01",
-  username: "truck1driver",
-  name: "Assigned Delivery Driver",
-  truckId: "TRK-01",
-  plate: "JICA Fleet",
-  pin: "1234",
-  password: "driver",
+// Minimal fallback structure only when offline with zero cached accounts
+const EMPTY_DRIVER = {
+  id: "",
+  username: "",
+  name: "Select Driver Account",
+  truckId: "",
+  plate: "",
+  pin: "",
+  password: "",
   role: "Driver"
 };
 
-export default function LoginScreen({ navigation }: any) {
+export default function LoginScreen({ navigation, route }: any) {
   const [loginMode, setLoginMode] = useState<'quick' | 'username'>('quick');
-  const [allAccounts, setAllAccounts] = useState<any[]>([DEFAULT_ACCOUNT]);
-  const [driversList, setDriversList] = useState<any[]>([DEFAULT_ACCOUNT]);
-  const [selectedDriver, setSelectedDriver] = useState<any>(DEFAULT_ACCOUNT);
+  const [allAccounts, setAllAccounts] = useState<any[]>([]);
+  const [driversList, setDriversList] = useState<any[]>([]);
+  const [selectedDriver, setSelectedDriver] = useState<any>(EMPTY_DRIVER);
   const [usernameInput, setUsernameInput] = useState('');
   const [passwordInput, setPasswordInput] = useState('');
   const [pin, setPin] = useState('');
-  const [errorMessage, setErrorMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState(route?.params?.notice || '');
   const [showDriverPicker, setShowDriverPicker] = useState(false);
   const [showGpsConsent, setShowGpsConsent] = useState(false);
   const [isLoadingDrivers, setIsLoadingDrivers] = useState(false);
@@ -56,16 +61,31 @@ export default function LoginScreen({ navigation }: any) {
   const [forgotMsg, setForgotMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
-    // 7-day session persistence check
+    if (route?.params?.notice) {
+      setErrorMessage(route.params.notice);
+    }
+  }, [route?.params?.notice]);
+
+  useEffect(() => {
+    // Strict single-session verification before auto-restoring saved login
     const checkSavedSession = async () => {
       try {
         const rawSession = await getSetting('driver_session');
         if (rawSession) {
           const parsed = JSON.parse(rawSession);
           const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
-          if (parsed?.driver && (Date.now() - (parsed.savedAt || 0) < SEVEN_DAYS)) {
-            navigation.replace('Main', { driver: parsed.driver });
-            return;
+          if (parsed?.driver?.id && (Date.now() - (parsed.savedAt || 0) < SEVEN_DAYS)) {
+            const check = await validateMobileSession(
+              parsed.driver.id,
+              parsed.session_token || parsed.driver.session_token || parsed.driver.active_session_token
+            );
+            if (!check.valid) {
+              await clearLocalSession();
+              setErrorMessage(check.reason || SESSION_REVOKED_MESSAGE);
+            } else {
+              navigation.replace('Main', { driver: parsed.driver });
+              return;
+            }
           }
         }
       } catch (err) {
@@ -89,7 +109,7 @@ export default function LoginScreen({ navigation }: any) {
             setDriversList(parsed);
             setSelectedDriver(parsed[0]);
           }
-        } catch (_) {}
+        } catch (_) { }
       }
 
       // 2. Fetch fresh accounts from Supabase
@@ -104,10 +124,11 @@ export default function LoginScreen({ navigation }: any) {
           id: u.id,
           username: u.username || u.full_name.toLowerCase().replace(/\s+/g, ""),
           name: u.full_name,
-          truckId: u.assigned_truck_id || "TRK-01",
-          plate: u.assigned_truck_id ? `Assigned: ${u.assigned_truck_id}` : "Fleet",
-          pin: u.mobile_pin || u.password || "1234",
-          password: u.password || "1234",
+          email: u.email || "",
+          truckId: u.assigned_truck_id || "",
+          plate: u.assigned_truck_id ? `Truck: ${u.assigned_truck_id}` : "Unassigned",
+          pin: u.mobile_pin || u.password || "",
+          password: u.password || "",
           role: u.role
         }));
 
@@ -120,8 +141,8 @@ export default function LoginScreen({ navigation }: any) {
           setSelectedDriver(driverAccounts[0]);
           await setSetting("cached_drivers", JSON.stringify(driverAccounts));
         } else {
-          setDriversList(mapped);
-          setSelectedDriver(mapped[0]);
+          setDriversList([]);
+          setSelectedDriver(EMPTY_DRIVER);
         }
       }
     } catch (e) {
@@ -150,34 +171,23 @@ export default function LoginScreen({ navigation }: any) {
       }
 
       const accountPool = allAccounts.length > 0 ? allAccounts : driversList;
-      const found = accountPool.find((d: any) => 
-        (d.username && d.username.toLowerCase() === cleanUser) || 
+      const found = accountPool.find((d: any) =>
+        (d.username && d.username.toLowerCase() === cleanUser) ||
         (d.name && d.name.toLowerCase().includes(cleanUser)) ||
         (d.truckId && d.truckId.toLowerCase() === cleanUser)
       );
 
-      if (!found) {
-        setErrorMessage("Account not found. Verify username or check Web Dashboard (Employee Management).");
-        return;
-      }
-
-      // Explicit role gate: Mobile app is strictly for delivery drivers
-      if (found.role !== "Driver") {
-        setErrorMessage("Mobile app is for Delivery Drivers only. Please log in with a Driver account.");
-        return;
-      }
-
-      driverToLogin = found;
-
-      // First attempt backend authentication via FastAPI (bcrypt verification)
+      // First attempt backend authentication via FastAPI (enforces single active session)
       let backendAuthSuccess = false;
+      let issuedSessionToken = "";
+      let issuedJwt = "";
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3500);
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
         const res = await fetch(`${BACKEND_URL}/api/v1/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: cleanUser, password: cleanPass }),
+          body: JSON.stringify({ username: cleanUser, password: cleanPass, app: "mobile" }),
           signal: controller.signal
         });
         clearTimeout(timeoutId);
@@ -190,36 +200,52 @@ export default function LoginScreen({ navigation }: any) {
               return;
             }
             backendAuthSuccess = true;
-            await setSetting("auth_token", authData.token);
+            issuedJwt = authData.token;
+            issuedSessionToken = authData.session_token || authData.token;
             driverToLogin = {
               id: authData.user.id,
               name: authData.user.full_name,
               username: authData.user.username || cleanUser,
-              truckId: authData.user.assigned_truck_id || found.truckId || "TRK-01",
-              plate: found.plate || "Fleet",
+              email: authData.user.email || "",
+              truckId: authData.user.assigned_truck_id || found?.truckId || "",
+              plate: found?.plate || (authData.user.assigned_truck_id ? `Truck: ${authData.user.assigned_truck_id}` : "Fleet"),
               role: authData.user.role,
+              session_token: issuedSessionToken,
               pin: cleanPass,
               password: cleanPass
             };
           }
-        } else if (res.status === 401) {
-          setErrorMessage("Incorrect password. Please verify your credentials or reset via Web Dashboard.");
+        } else if (res.status === 401 || res.status === 403) {
+          const errJson = await res.json().catch(() => ({}));
+          setErrorMessage(errJson.detail || "Incorrect password. Please verify your credentials or reset via Web Dashboard.");
           return;
         }
       } catch (netErr) {
-        // Backend offline / local LAN unreachable: continue to cached fallback
+        // Backend offline / unreachable: check cached driver below
       }
 
       if (!backendAuthSuccess) {
-        const validPasswords = [found.password, found.pin, found.username, "1234", "owner"].filter(Boolean);
-
+        if (!found) {
+          setErrorMessage("Account not found. Connect to internet or verify your driver username.");
+          return;
+        }
+        if (found.role !== "Driver") {
+          setErrorMessage("Mobile app is for Delivery Drivers only. Please log in with a Driver account.");
+          return;
+        }
+        const validPasswords = [found.password, found.pin].filter(Boolean);
         if (!validPasswords.includes(cleanPass)) {
           setErrorMessage("Incorrect password. Please check your credentials or reset via Web Dashboard.");
           return;
         }
+        driverToLogin = found;
       }
     } else {
       // Quick Mode via PIN
+      if (!selectedDriver || !selectedDriver.id) {
+        setErrorMessage("No driver account selected. Pull down or tap Refresh to load drivers.");
+        return;
+      }
       if (selectedDriver.role !== "Driver") {
         setErrorMessage("Mobile app is for Delivery Drivers only. Please log in with a Driver account.");
         return;
@@ -233,13 +259,14 @@ export default function LoginScreen({ navigation }: any) {
       let backendPinSuccess = false;
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3500);
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
         const res = await fetch(`${BACKEND_URL}/api/v1/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            username: selectedDriver.username || selectedDriver.name, 
-            password: pin 
+          body: JSON.stringify({
+            username: selectedDriver.username || selectedDriver.name,
+            password: pin,
+            app: "mobile"
           }),
           signal: controller.signal
         });
@@ -253,25 +280,29 @@ export default function LoginScreen({ navigation }: any) {
               return;
             }
             backendPinSuccess = true;
-            await setSetting("auth_token", authData.token);
+            const sessTok = authData.session_token || authData.token;
             driverToLogin = {
               ...selectedDriver,
               id: authData.user.id,
               name: authData.user.full_name,
-              role: authData.user.role
+              email: authData.user.email || selectedDriver.email || "",
+              truckId: authData.user.assigned_truck_id || selectedDriver.truckId || "",
+              role: authData.user.role,
+              session_token: sessTok
             };
+            await saveDriverSession(driverToLogin, sessTok, authData.token);
           }
-        } else if (res.status === 401) {
-          setErrorMessage(`Incorrect PIN for ${selectedDriver.name}.`);
+        } else if (res.status === 401 || res.status === 403) {
+          const errJson = await res.json().catch(() => ({}));
+          setErrorMessage(errJson.detail || `Incorrect PIN for ${selectedDriver.name}.`);
           return;
         }
       } catch (netErr) {
-        // Offline / LAN unreachable: proceed to cached fallback
+        // Offline / unreachable: proceed to cached fallback
       }
 
       if (!backendPinSuccess) {
-        const validPins = [selectedDriver.pin, selectedDriver.password, "1234", "9999"].filter(Boolean);
-
+        const validPins = [selectedDriver.pin, selectedDriver.password].filter(Boolean);
         if (!validPins.includes(pin)) {
           setErrorMessage(`Incorrect PIN for ${selectedDriver.name}.`);
           return;
@@ -289,9 +320,13 @@ export default function LoginScreen({ navigation }: any) {
     const consentKey = `consent_accepted_${driverToLogin.id}`;
     const alreadyAccepted = await getSetting(consentKey);
 
-    // Save driver session for 7-day persistence
+    // Save driver session & strict session_token for 7-day persistence
     try {
-      await setSetting('driver_session', JSON.stringify({ driver: driverToLogin, savedAt: Date.now() }));
+      await saveDriverSession(
+        driverToLogin,
+        driverToLogin.session_token || `offline-${Date.now()}`,
+        undefined
+      );
     } catch (saveErr) {
       console.warn("Failed to persist driver session:", saveErr);
     }
@@ -314,9 +349,12 @@ export default function LoginScreen({ navigation }: any) {
     const consentKey = `consent_accepted_${selectedDriver.id}`;
     await setSetting(consentKey, new Date().toISOString());
 
-    // Save driver session for 7-day persistence
     try {
-      await setSetting('driver_session', JSON.stringify({ driver: selectedDriver, savedAt: Date.now() }));
+      await saveDriverSession(
+        selectedDriver,
+        selectedDriver.session_token || `offline-${Date.now()}`,
+        undefined
+      );
     } catch (saveErr) {
       console.warn("Failed to persist driver session:", saveErr);
     }
@@ -401,19 +439,19 @@ export default function LoginScreen({ navigation }: any) {
 
   return (
     <SafeAreaView style={styles.container}>
-      <KeyboardAvoidingView 
+      <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         style={styles.content}
       >
-        <ScrollView 
-          contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }} 
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }}
           showsVerticalScrollIndicator={false}
         >
           <View style={styles.logoContainer}>
-            <Image 
-              source={require('../../assets/JICA Ice Logistics Logo.png')} 
-              style={styles.logoImage} 
-              resizeMode="contain" 
+            <Image
+              source={require('../../assets/JICA Ice Logistics Logo.png')}
+              style={styles.logoImage}
+              resizeMode="contain"
             />
             <Text style={styles.title}>JICA Ice Logistics</Text>
             <Text style={styles.subtitle}>Driver Shift Portal • Cagayan de Oro</Text>
@@ -451,7 +489,7 @@ export default function LoginScreen({ navigation }: any) {
               <>
                 {/* Driver Account Selector */}
                 <Text style={styles.label}>Select Driver Account</Text>
-                <TouchableOpacity 
+                <TouchableOpacity
                   style={styles.driverSelector}
                   onPress={() => setShowDriverPicker(!showDriverPicker)}
                 >
@@ -524,8 +562,8 @@ export default function LoginScreen({ navigation }: any) {
               </View>
             ) : null}
 
-            <TouchableOpacity 
-              style={styles.button} 
+            <TouchableOpacity
+              style={styles.button}
               onPress={handleLoginPress}
             >
               <Text style={styles.buttonText}>Log In to Daily Route</Text>
@@ -557,7 +595,7 @@ export default function LoginScreen({ navigation }: any) {
         animationType="fade"
         onRequestClose={() => setShowDriverPicker(false)}
       >
-        <TouchableOpacity 
+        <TouchableOpacity
           style={styles.modalOverlay}
           activeOpacity={1}
           onPress={() => setShowDriverPicker(false)}
@@ -622,7 +660,7 @@ export default function LoginScreen({ navigation }: any) {
               </View>
             </ScrollView>
 
-            <TouchableOpacity 
+            <TouchableOpacity
               style={styles.consentButton}
               onPress={handleAcceptGpsAndEnter}
             >
@@ -642,7 +680,7 @@ export default function LoginScreen({ navigation }: any) {
           if (!forgotLoading) setShowForgotModal(false);
         }}
       >
-        <KeyboardAvoidingView 
+        <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={styles.modalOverlay}
         >

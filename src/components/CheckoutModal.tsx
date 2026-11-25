@@ -51,7 +51,8 @@ export default function CheckoutModal({
   onComplete 
 }: CheckoutModalProps) {
   const planned = stop?.plannedQty || Math.max(1, Math.round((stop?.amount || 150) / 150));
-  const unitPrice = stop?.unitPrice || (stop?.amount ? Math.round(stop.amount / planned) : 150);
+  const unitPrice =
+    stop?.unitPrice ?? (stop?.amount ? Math.round((stop.amount / planned) * 100) / 100 : 150);
 
   const [deliveredQty, setDeliveredQty] = useState<number>(planned);
   const [selectedReason, setSelectedReason] = useState<string>(PARTIAL_REASONS[0]);
@@ -59,19 +60,19 @@ export default function CheckoutModal({
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
   useEffect(() => {
-    if (stop) {
+    if (visible && stop) {
       const initPlanned = stop.plannedQty || Math.max(1, Math.round((stop.amount || 150) / 150));
       setDeliveredQty(initPlanned);
       setSelectedReason(PARTIAL_REASONS[0]);
       setCustomReason('');
       setIsSubmitting(false);
     }
-  }, [stop]);
+  }, [visible, stop]);
 
   if (!stop) return null;
 
   const returnedQty = Math.max(0, planned - deliveredQty);
-  const totalPayable = deliveredQty * unitPrice;
+  const totalPayable = Math.round(deliveredQty * Math.round(unitPrice * 100)) / 100;
   const isPartial = deliveredQty < planned;
 
   const handleDecrement = () => {
